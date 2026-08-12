@@ -7,6 +7,8 @@ A Home Assistant custom integration that adds a **chat panel to the sidebar**, w
 
 The headline feature is **tool-call approval**: every MCP tool call the model wants to make is shown in the chat with **Approve / Always allow / Reject** buttons before it runs. "Always allow" auto-approves that specific tool from then on (per browser, manageable in the panel's ⚙ settings).
 
+<img width="904" height="482" alt="Example Chat" src="https://github.com/user-attachments/assets/abf84679-36e0-49d9-a9d0-e6b8a6843644" />
+
 ## Installation
 
 ### HACS
