@@ -18,6 +18,70 @@ class LLMError(Exception):
     """The LLM endpoint failed or returned an unexpected response."""
 
 
+async def async_stream_chat_completion(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+    api_key: str | None = None,
+):
+    """Yield parsed SSE chunks from a streaming chat completion."""
+    url = base_url.rstrip("/") + "/chat/completions"
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        # Ask for token usage in the final chunk (OpenAI, LM Studio,
+        # Ollama, vLLM and llama.cpp all support this).
+        "stream_options": {"include_usage": True},
+    }
+    if tools:
+        payload["tools"] = tools
+
+    resp: aiohttp.ClientResponse | None = None
+    for attempt in (0, 1):
+        try:
+            resp = await session.post(
+                url, json=payload, headers=headers, timeout=LLM_TIMEOUT
+            )
+        except (aiohttp.ClientError, OSError) as err:
+            raise LLMError(f"Could not reach LLM at {url}: {err}") from err
+        if resp.status == 200:
+            break
+        body = await resp.text()
+        resp.close()
+        if attempt == 0 and resp.status == 400 and "stream_options" in body:
+            # Server rejects stream_options; drop it and retry once.
+            payload.pop("stream_options", None)
+            continue
+        raise LLMError(f"LLM returned HTTP {resp.status}: {body[:500]}")
+
+    try:
+        async for raw_line in resp.content:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except ValueError:
+                continue
+            if isinstance(chunk, dict):
+                yield chunk
+    except (aiohttp.ClientError, OSError) as err:
+        raise LLMError(f"LLM stream failed: {err}") from err
+    except TimeoutError as err:
+        raise LLMError("LLM stream timed out") from err
+    finally:
+        resp.close()
+
+
 async def async_chat_completion(
     session: aiohttp.ClientSession,
     base_url: str,

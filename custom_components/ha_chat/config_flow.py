@@ -15,11 +15,13 @@ from homeassistant.config_entries import (
 from homeassistant.core import callback
 
 from .const import (
+    CONF_CONTEXT_WINDOW,
     CONF_LLM_API_KEY,
     CONF_LLM_MODEL,
     CONF_LLM_URL,
     CONF_MCP_TOKEN,
     CONF_MCP_URL,
+    DEFAULT_CONTEXT_WINDOW,
     DEFAULT_LLM_URL,
     DOMAIN,
 )
@@ -43,6 +45,10 @@ def _schema(defaults: dict[str, Any]) -> vol.Schema:
                 CONF_MCP_TOKEN,
                 description={"suggested_value": defaults.get(CONF_MCP_TOKEN, "")},
             ): str,
+            vol.Required(
+                CONF_CONTEXT_WINDOW,
+                default=defaults.get(CONF_CONTEXT_WINDOW, DEFAULT_CONTEXT_WINDOW),
+            ): vol.All(vol.Coerce(int), vol.Range(min=1024)),
         }
     )
 

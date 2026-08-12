@@ -20,6 +20,11 @@ const SYSTEM_PROMPT = [
 const uid = () =>
   crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
 
+// Placeholder sentinels for the markdown renderer, built at runtime so the
+// source file contains no control characters.
+const FENCE_MARK = String.fromCharCode(0);
+const CODE_MARK = String.fromCharCode(1);
+
 function escapeHtml(text) {
   return text
     .replace(/&/g, "&amp;")
@@ -39,29 +44,155 @@ function contentToText(content) {
   return String(content);
 }
 
-function renderMarkdown(raw) {
-  let text = contentToText(raw).replace(/<think>[\s\S]*?<\/think>/g, "").trim();
-  const codeBlocks = [];
-  text = text.replace(/```\w*\n?([\s\S]*?)```/g, (m, code) => {
-    codeBlocks.push(code.replace(/\n$/, ""));
-    return `\u0000${codeBlocks.length - 1}\u0000`;
+/* ---------- markdown ---------- */
+
+// Inline formatting for already-HTML-escaped text.
+function inlineMd(text) {
+  const codeSpans = [];
+  text = text.replace(/`([^`\n]+)`/g, (m, code) => {
+    codeSpans.push(code);
+    return `${CODE_MARK}${codeSpans.length - 1}${CODE_MARK}`;
   });
-  text = escapeHtml(text);
-  text = text.replace(/`([^`\n]+)`/g, "<code>$1</code>");
-  text = text.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
-  text = text.replace(/^#{1,4} (.*)$/gm, "<strong>$1</strong>");
-  text = text.replace(/^[-*] (.*)$/gm, "&nbsp;•&nbsp;$1");
   text = text.replace(
     /\[([^\]]+)\]\((https?:[^\s)]+)\)/g,
     '<a href="$2" target="_blank" rel="noopener">$1</a>'
   );
-  text = text.replace(/\n/g, "<br>");
+  text = text.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  text = text.replace(/__([^_]+)__/g, "<strong>$1</strong>");
   text = text.replace(
-    /\u0000(\d+)\u0000/g,
-    (m, i) => `<pre><code>${escapeHtml(codeBlocks[+i])}</code></pre>`
+    /(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?:;]|$)/g,
+    "$1<em>$2</em>"
   );
+  text = text.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+  const markPattern = new RegExp(`${CODE_MARK}(\\d+)${CODE_MARK}`, "g");
+  text = text.replace(markPattern, (m, i) => `<code>${codeSpans[+i] ?? ""}</code>`);
   return text;
 }
+
+function renderMarkdown(raw) {
+  let text = contentToText(raw)
+    .replace(/<think>[\s\S]*?<\/think>/g, "")
+    .replace(/\r\n/g, "\n")
+    .trim();
+
+  // Pull out fenced code blocks first. An unterminated fence (mid-stream)
+  // still renders as a code block.
+  const fences = [];
+  text = text.replace(/```\w*\n?([\s\S]*?)(?:```|$)/g, (m, code) => {
+    fences.push(code.replace(/\n$/, ""));
+    return `\n${FENCE_MARK}${fences.length - 1}${FENCE_MARK}\n`;
+  });
+  text = escapeHtml(text);
+
+  const fenceLine = new RegExp(`^${FENCE_MARK}(\\d+)${FENCE_MARK}\\s*$`);
+  const lines = text.split("\n");
+  const out = [];
+  let para = [];
+  let list = null;
+  let quote = [];
+
+  const flushPara = () => {
+    if (para.length) {
+      out.push(`<p>${para.map(inlineMd).join("<br>")}</p>`);
+      para = [];
+    }
+  };
+  const flushList = () => {
+    if (list) {
+      out.push(
+        `<${list.type}>${list.items
+          .map((item) => `<li>${inlineMd(item)}</li>`)
+          .join("")}</${list.type}>`
+      );
+      list = null;
+    }
+  };
+  const flushQuote = () => {
+    if (quote.length) {
+      out.push(`<blockquote>${quote.map(inlineMd).join("<br>")}</blockquote>`);
+      quote = [];
+    }
+  };
+  const flushAll = () => {
+    flushPara();
+    flushList();
+    flushQuote();
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    let m;
+    if ((m = line.match(fenceLine))) {
+      flushAll();
+      out.push(`<pre><code>${fences[+m[1]] ?? ""}</code></pre>`);
+    } else if ((m = line.match(/^(#{1,6})\s+(.*)$/))) {
+      flushAll();
+      const level = Math.min(m[1].length + 2, 6);
+      out.push(`<h${level}>${inlineMd(m[2])}</h${level}>`);
+    } else if (/^\s*([-*_])\s*(?:\1\s*){2,}$/.test(line)) {
+      flushAll();
+      out.push("<hr>");
+    } else if ((m = line.match(/^&gt;\s?(.*)$/))) {
+      flushPara();
+      flushList();
+      quote.push(m[1]);
+    } else if ((m = line.match(/^\s*[-*+]\s+(.*)$/))) {
+      flushPara();
+      flushQuote();
+      if (!list || list.type !== "ul") {
+        flushList();
+        list = { type: "ul", items: [] };
+      }
+      list.items.push(m[1]);
+    } else if ((m = line.match(/^\s*\d+[.)]\s+(.*)$/))) {
+      flushPara();
+      flushQuote();
+      if (!list || list.type !== "ol") {
+        flushList();
+        list = { type: "ol", items: [] };
+      }
+      list.items.push(m[1]);
+    } else if (
+      line.includes("|") &&
+      i + 1 < lines.length &&
+      /^\s*\|?[\s:|-]+\|[\s:|-]*$/.test(lines[i + 1]) &&
+      lines[i + 1].includes("-")
+    ) {
+      flushAll();
+      const parseRow = (l) =>
+        l
+          .replace(/^\s*\|/, "")
+          .replace(/\|\s*$/, "")
+          .split("|")
+          .map((cell) => inlineMd(cell.trim()));
+      const header = parseRow(line);
+      i += 1; // skip separator row
+      const rows = [];
+      while (i + 1 < lines.length && lines[i + 1].includes("|")) {
+        rows.push(parseRow(lines[++i]));
+      }
+      out.push(
+        `<table><thead><tr>${header
+          .map((h) => `<th>${h}</th>`)
+          .join("")}</tr></thead><tbody>` +
+          rows
+            .map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join("")}</tr>`)
+            .join("") +
+          "</tbody></table>"
+      );
+    } else if (line.trim() === "") {
+      flushAll();
+    } else {
+      flushList();
+      flushQuote();
+      para.push(line);
+    }
+  }
+  flushAll();
+  return out.join("");
+}
+
+/* ---------- misc helpers ---------- */
 
 function prettyArgs(argsJson) {
   try {
@@ -114,6 +245,10 @@ class HaChatPanel extends HTMLElement {
     this._serverConfig = null;
     this._tools = null;
     this._toolsError = null;
+    this._streamText = "";
+    this._streamRaf = null;
+    this._unsubStream = null;
+    this._stopCurrent = null;
 
     this.chats = loadJson(STORAGE_CHATS, []);
     this.autoApprove = new Set(loadJson(STORAGE_AUTO_APPROVE, []));
@@ -197,6 +332,7 @@ class HaChatPanel extends HTMLElement {
       updatedAt: Date.now(),
       messages: [],
       pending: null,
+      usage: null,
     };
     this.chats.unshift(chat);
     this.currentId = chat.id;
@@ -256,44 +392,131 @@ class HaChatPanel extends HTMLElement {
   async _runLLM(chat) {
     this._busy = true;
     this._error = null;
+    this._streamText = "";
     this._render();
-    let response;
-    try {
-      response = await this._ws({
-        type: "ha_chat/chat",
-        messages: [{ role: "system", content: SYSTEM_PROMPT }, ...chat.messages],
-      });
-    } catch (e) {
-      this._busy = false;
-      this._error = e?.message || "Request failed";
-      this._render();
-      return;
-    }
-    this._busy = false;
-    this._warning = response.warning || null;
-    const message = response.message;
-    chat.messages.push(message);
-    this._touch(chat);
 
-    const toolCalls = message.tool_calls || [];
-    if (toolCalls.length) {
-      chat.pending = {
-        calls: toolCalls.map((tc) => ({
-          id: tc.id,
-          name: tc.function?.name || "unknown",
-          args: tc.function?.arguments || "{}",
-          status: this.autoApprove.has(tc.function?.name) ? "approved" : "pending",
-          result: null,
-        })),
-      };
-      this._save();
-      this._render();
-      this._maybeExecute(chat);
-    } else {
-      chat.pending = null;
-      this._save();
+    let unsub = null;
+    let finished = false;
+
+    const cleanup = () => {
+      if (unsub) {
+        try {
+          unsub();
+        } catch (e) {
+          /* connection may be gone */
+        }
+      }
+      this._unsubStream = null;
+      this._stopCurrent = null;
+    };
+
+    const finalize = (message, meta) => {
+      if (finished) return;
+      finished = true;
+      this._busy = false;
+      this._streamText = "";
+      cleanup();
+      if (!message) {
+        this._render();
+        return;
+      }
+      if (meta) message._ui = meta;
+      chat.messages.push(message);
+      if (meta?.usage) chat.usage = meta.usage;
+      this._touch(chat);
+
+      const toolCalls = message.tool_calls || [];
+      if (toolCalls.length) {
+        chat.pending = {
+          calls: toolCalls.map((tc) => ({
+            id: tc.id,
+            name: tc.function?.name || "unknown",
+            args: tc.function?.arguments || "{}",
+            status: this.autoApprove.has(tc.function?.name)
+              ? "approved"
+              : "pending",
+            result: null,
+          })),
+        };
+        this._save();
+        this._render();
+        this._maybeExecute(chat);
+      } else {
+        chat.pending = null;
+        this._save();
+        this._render();
+      }
+    };
+
+    const onEvent = (ev) => {
+      if (ev.type === "delta") {
+        this._streamText += ev.content;
+        this._renderStream();
+      } else if (ev.type === "done") {
+        this._warning = ev.warning || null;
+        finalize(ev.message, {
+          rate: ev.token_rate,
+          tokens: ev.completion_tokens,
+          estimated: ev.estimated,
+          elapsed: ev.elapsed,
+          usage: ev.usage || null,
+        });
+      } else if (ev.type === "error") {
+        this._error = ev.error || "Request failed";
+        finalize(
+          this._streamText
+            ? { role: "assistant", content: this._streamText }
+            : null,
+          { partial: true }
+        );
+      }
+    };
+
+    this._stopCurrent = () => {
+      const partial = this._streamText;
+      finalize(
+        partial ? { role: "assistant", content: partial } : null,
+        { stopped: true }
+      );
+    };
+
+    try {
+      unsub = await this._hass.connection.subscribeMessage(
+        onEvent,
+        {
+          type: "ha_chat/chat_stream",
+          messages: [
+            { role: "system", content: SYSTEM_PROMPT },
+            ...chat.messages,
+          ],
+        },
+        { resubscribe: false }
+      );
+      this._unsubStream = unsub;
+      // The user hit stop before the subscription resolved.
+      if (finished) cleanup();
+    } catch (e) {
+      this._error = e?.message || "Request failed";
+      finished = true;
+      this._busy = false;
+      this._stopCurrent = null;
       this._render();
     }
+  }
+
+  _renderStream() {
+    if (this._streamRaf) return;
+    this._streamRaf = requestAnimationFrame(() => {
+      this._streamRaf = null;
+      const bubble = this.shadowRoot.querySelector("#stream-bubble");
+      if (bubble) {
+        bubble.innerHTML = renderMarkdown(this._streamText);
+        const container = this.$("#messages");
+        container.scrollTop = container.scrollHeight;
+      } else {
+        this._render();
+      }
+    });
   }
 
   _setCallStatus(chat, callId, status) {
@@ -327,6 +550,7 @@ class HaChatPanel extends HTMLElement {
     if (calls.some((c) => c.status === "pending")) return;
 
     this._executing = true;
+    this._render();
     for (const call of calls) {
       if (call.status !== "approved") continue;
       call.status = "running";
@@ -350,7 +574,8 @@ class HaChatPanel extends HTMLElement {
     for (const call of calls) {
       let content;
       if (call.status === "rejected") {
-        content = "The user rejected this tool call. Do not retry it unless asked.";
+        content =
+          "The user rejected this tool call. Do not retry it unless asked.";
       } else {
         content = call.result ?? "(no output)";
       }
@@ -399,6 +624,7 @@ class HaChatPanel extends HTMLElement {
           <div id="messages"></div>
           <div id="composer">
             <textarea id="input" rows="1" placeholder="Message…"></textarea>
+            <div id="ctx-gauge" title="Context utilization"></div>
             <button id="send" class="primary" title="Send">➤</button>
           </div>
         </div>
@@ -449,9 +675,13 @@ class HaChatPanel extends HTMLElement {
   }
 
   _handleSend() {
+    if (this._busy) {
+      this._stopCurrent?.();
+      return;
+    }
     const input = this.$("#input");
     const text = input.value.trim();
-    if (!text || this._busy || this._executing) return;
+    if (!text || this._executing) return;
     const chat = this._currentChat();
     if (chat?.pending) return;
     input.value = "";
@@ -558,6 +788,19 @@ class HaChatPanel extends HTMLElement {
     }
   }
 
+  _msgMeta(ui) {
+    const meta = document.createElement("div");
+    meta.className = "msg-meta";
+    const bits = [];
+    if (ui.rate) bits.push(`${ui.estimated ? "~" : ""}${ui.rate} tok/s`);
+    if (ui.tokens) bits.push(`${ui.estimated ? "~" : ""}${ui.tokens} tokens`);
+    if (ui.elapsed) bits.push(`${ui.elapsed}s`);
+    if (ui.stopped) bits.push("stopped by user");
+    if (ui.partial) bits.push("interrupted");
+    meta.textContent = bits.join(" · ");
+    return meta;
+  }
+
   _renderMessages() {
     const container = this.$("#messages");
     const atBottom =
@@ -565,7 +808,7 @@ class HaChatPanel extends HTMLElement {
     container.textContent = "";
     const chat = this._currentChat();
 
-    if (!chat || !chat.messages.length) {
+    if ((!chat || !chat.messages.length) && !this._busy) {
       const welcome = document.createElement("div");
       welcome.className = "welcome";
       welcome.innerHTML = `
@@ -579,11 +822,11 @@ class HaChatPanel extends HTMLElement {
 
     // Map tool results back to their originating call for inline display.
     const toolResults = new Map();
-    for (const message of chat.messages) {
+    for (const message of chat?.messages || []) {
       if (message.role === "tool") toolResults.set(message.tool_call_id, message);
     }
 
-    for (const message of chat.messages) {
+    for (const message of chat?.messages || []) {
       if (message.role === "system" || message.role === "tool") continue;
 
       if (message.role === "user") {
@@ -611,13 +854,20 @@ class HaChatPanel extends HTMLElement {
       for (const tc of message.tool_calls || []) {
         const isPending = chat.pending?.calls.some((c) => c.id === tc.id);
         if (isPending) continue; // rendered as an approval card below
-        container.appendChild(
-          this._toolHistoryCard(tc, toolResults.get(tc.id))
-        );
+        container.appendChild(this._toolHistoryCard(tc, toolResults.get(tc.id)));
+      }
+      if (
+        message._ui &&
+        (message._ui.rate ||
+          message._ui.tokens ||
+          message._ui.stopped ||
+          message._ui.partial)
+      ) {
+        container.appendChild(this._msgMeta(message._ui));
       }
     }
 
-    if (chat.pending) {
+    if (chat?.pending) {
       for (const call of chat.pending.calls) {
         container.appendChild(this._approvalCard(chat, call));
       }
@@ -633,10 +883,21 @@ class HaChatPanel extends HTMLElement {
     }
 
     if (this._busy) {
-      const typing = document.createElement("div");
-      typing.className = "typing";
-      typing.innerHTML = "<span></span><span></span><span></span>";
-      container.appendChild(typing);
+      if (this._streamText) {
+        const row = document.createElement("div");
+        row.className = "msg-row assistant";
+        const bubble = document.createElement("div");
+        bubble.className = "bubble assistant streaming";
+        bubble.id = "stream-bubble";
+        bubble.innerHTML = renderMarkdown(this._streamText);
+        row.appendChild(bubble);
+        container.appendChild(row);
+      } else {
+        const typing = document.createElement("div");
+        typing.className = "typing";
+        typing.innerHTML = "<span></span><span></span><span></span>";
+        container.appendChild(typing);
+      }
     }
 
     if (atBottom) container.scrollTop = container.scrollHeight;
@@ -744,15 +1005,53 @@ class HaChatPanel extends HTMLElement {
 
   _renderComposerState() {
     const chat = this._currentChat();
-    const blocked = this._busy || this._executing || !!chat?.pending;
     const send = this.$("#send");
     const input = this.$("#input");
-    send.disabled = blocked;
+    send.textContent = this._busy ? "■" : "➤";
+    send.title = this._busy ? "Stop generating" : "Send";
+    send.classList.toggle("stop", this._busy);
+    send.disabled = !this._busy && (this._executing || !!chat?.pending);
     input.placeholder = chat?.pending
       ? "Resolve the pending tool calls first…"
       : this._busy
-        ? "Waiting for the model…"
+        ? "Generating…"
         : "Message…";
+    this._renderGauge(chat);
+  }
+
+  _renderGauge(chat) {
+    const gauge = this.$("#ctx-gauge");
+    const limit = this._serverConfig?.context_window || 32768;
+    let used = null;
+    let estimated = false;
+    const usage = chat?.usage;
+    if (usage?.total_tokens) {
+      used = usage.total_tokens;
+    } else if (usage?.prompt_tokens) {
+      used = usage.prompt_tokens + (usage.completion_tokens || 0);
+    }
+    if (used == null) {
+      estimated = true;
+      const text = chat ? JSON.stringify(chat.messages) : "";
+      used = Math.round((text.length + SYSTEM_PROMPT.length) / 4);
+    }
+    const pct = Math.min(100, Math.round((used / limit) * 100));
+    const color =
+      pct >= 90
+        ? "var(--error-color, #db4437)"
+        : pct >= 70
+          ? "var(--warning-color, #ffa600)"
+          : "var(--success-color, #0f9d58)";
+    gauge.title = `Context: ${estimated ? "~" : ""}${used.toLocaleString()} / ${limit.toLocaleString()} tokens (${pct}%)`;
+    // Ring circumference for r=15.5 is ~97.4.
+    const dash = ((pct / 100) * 97.4).toFixed(1);
+    gauge.innerHTML = `
+      <svg viewBox="0 0 36 36">
+        <path class="ring-bg" d="M18 2.5 a 15.5 15.5 0 0 1 0 31 a 15.5 15.5 0 0 1 0 -31"/>
+        <path class="ring-fg" stroke="${color}" stroke-dasharray="${dash}, 97.4"
+          d="M18 2.5 a 15.5 15.5 0 0 1 0 31 a 15.5 15.5 0 0 1 0 -31"/>
+        <text x="18" y="22" text-anchor="middle" class="ring-text">${pct}</text>
+      </svg>`;
   }
 
   /* ---------- settings dialog ---------- */
@@ -770,6 +1069,7 @@ class HaChatPanel extends HTMLElement {
       <div class="kv"><span>Model</span><span>${escapeHtml(conf?.model || "?")}</span></div>
       <div class="kv"><span>LLM</span><span>${escapeHtml(conf?.llm_url || "?")}</span></div>
       <div class="kv"><span>MCP</span><span>${escapeHtml(conf?.mcp_url || "?")}</span></div>
+      <div class="kv"><span>Context window</span><span>${(conf?.context_window || 32768).toLocaleString()} tokens</span></div>
       <div class="kv"><span>Tools</span><span>${
         this._tools ? this._tools.length : escapeHtml(this._toolsError || "…")
       }</span></div>
@@ -970,12 +1270,50 @@ const STYLES = `
     border-bottom-left-radius: 4px;
     white-space: normal;
   }
+  .bubble.assistant p { margin: 6px 0; }
+  .bubble.assistant p:first-child, .bubble.assistant > :first-child { margin-top: 0; }
+  .bubble.assistant p:last-child, .bubble.assistant > :last-child { margin-bottom: 0; }
+  .bubble.assistant h3, .bubble.assistant h4, .bubble.assistant h5, .bubble.assistant h6 {
+    margin: 12px 0 6px;
+    line-height: 1.3;
+  }
+  .bubble.assistant h3 { font-size: 17px; }
+  .bubble.assistant h4 { font-size: 15px; }
+  .bubble.assistant h5, .bubble.assistant h6 { font-size: 14px; }
+  .bubble.assistant ul, .bubble.assistant ol { margin: 6px 0; padding-left: 22px; }
+  .bubble.assistant li { margin: 2px 0; }
+  .bubble.assistant blockquote {
+    margin: 6px 0;
+    padding: 4px 12px;
+    border-left: 3px solid var(--primary-color, #03a9f4);
+    color: var(--secondary-text-color, #727272);
+  }
+  .bubble.assistant hr {
+    border: none;
+    border-top: 1px solid var(--divider-color, #e0e0e0);
+    margin: 10px 0;
+  }
+  .bubble.assistant table {
+    border-collapse: collapse;
+    margin: 8px 0;
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    font-size: 13px;
+  }
+  .bubble.assistant th, .bubble.assistant td {
+    border: 1px solid var(--divider-color, #e0e0e0);
+    padding: 4px 10px;
+    text-align: left;
+  }
+  .bubble.assistant th { background: var(--secondary-background-color, #f5f5f5); }
   .bubble.assistant pre {
     background: var(--secondary-background-color, #f5f5f5);
     padding: 10px;
     border-radius: 8px;
     overflow-x: auto;
     margin: 8px 0;
+    white-space: pre;
   }
   .bubble.assistant code {
     background: var(--secondary-background-color, #f5f5f5);
@@ -984,6 +1322,18 @@ const STYLES = `
   }
   .bubble.assistant pre code { background: none; padding: 0; }
   .bubble.assistant a { color: var(--primary-color, #03a9f4); }
+  .bubble.assistant.streaming::after {
+    content: "▍";
+    animation: cursor-blink 1s steps(1) infinite;
+    color: var(--primary-color, #03a9f4);
+  }
+  @keyframes cursor-blink { 50% { opacity: 0; } }
+
+  .msg-meta {
+    font-size: 11px;
+    color: var(--secondary-text-color, #727272);
+    margin: -6px 0 0 6px;
+  }
 
   .tool-card {
     border: 1px solid var(--divider-color, #e0e0e0);
@@ -994,7 +1344,7 @@ const STYLES = `
     max-width: 78%;
   }
   .tool-card.pending-card.pending { border-color: var(--primary-color, #03a9f4); }
-  .tool-card.pending-card.error, .tool-status.error { border-color: var(--error-color, #db4437); }
+  .tool-card.pending-card.error { border-color: var(--error-color, #db4437); }
   .tool-head { display: flex; align-items: center; gap: 8px; }
   .tool-name { font-family: SFMono-Regular, Menlo, Consolas, monospace; font-weight: 600; }
   .tool-status.done { color: var(--success-color, #0f9d58); }
@@ -1034,6 +1384,7 @@ const STYLES = `
   #composer {
     display: flex;
     gap: 8px;
+    align-items: flex-end;
     padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
     border-top: 1px solid var(--divider-color, #e0e0e0);
     background: var(--card-background-color, #fff);
@@ -1054,7 +1405,29 @@ const STYLES = `
     max-height: 160px;
   }
   #input:focus { border-color: var(--primary-color, #03a9f4); }
-  #send { min-width: 48px; }
+  #ctx-gauge {
+    width: 38px;
+    height: 38px;
+    flex: none;
+    cursor: default;
+  }
+  #ctx-gauge svg { width: 100%; height: 100%; }
+  #ctx-gauge .ring-bg {
+    fill: none;
+    stroke: var(--divider-color, #e0e0e0);
+    stroke-width: 3.5;
+  }
+  #ctx-gauge .ring-fg {
+    fill: none;
+    stroke-width: 3.5;
+    stroke-linecap: round;
+  }
+  #ctx-gauge .ring-text {
+    font-size: 11px;
+    fill: var(--secondary-text-color, #727272);
+  }
+  #send { min-width: 48px; height: 40px; }
+  #send.stop { background: var(--error-color, #db4437); }
 
   /* narrow / mobile */
   #layout.narrow #sidebar {
