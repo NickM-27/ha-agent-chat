@@ -622,6 +622,7 @@ class HaChatPanel extends HTMLElement {
           </div>
           <div id="banner-area"></div>
           <div id="messages"></div>
+          <div id="ctx-popover" hidden></div>
           <div id="composer">
             <textarea id="input" rows="1" placeholder="Message…"></textarea>
             <div id="ctx-gauge" title="Context utilization"></div>
@@ -657,6 +658,15 @@ class HaChatPanel extends HTMLElement {
     this.$("#settings-overlay").addEventListener("click", (ev) => {
       if (ev.target === ev.currentTarget) {
         this.$("#settings-overlay").setAttribute("hidden", "");
+      }
+    });
+    this.$("#ctx-gauge").addEventListener("click", () => this._toggleCtxPopover());
+    this.shadowRoot.addEventListener("click", (ev) => {
+      const popover = this.$("#ctx-popover");
+      if (popover.hasAttribute("hidden")) return;
+      const path = ev.composedPath();
+      if (!path.includes(popover) && !path.includes(this.$("#ctx-gauge"))) {
+        popover.setAttribute("hidden", "");
       }
     });
 
@@ -745,7 +755,7 @@ class HaChatPanel extends HTMLElement {
       time.textContent = relTime(chat.updatedAt);
       const del = document.createElement("button");
       del.className = "icon-btn chat-del";
-      del.textContent = "🗑";
+      del.innerHTML = '<ha-icon icon="mdi:delete-outline"></ha-icon>';
       del.title = "Delete chat";
       del.addEventListener("click", (ev) => {
         ev.stopPropagation();
@@ -1019,16 +1029,17 @@ class HaChatPanel extends HTMLElement {
     this._renderGauge(chat);
   }
 
-  _renderGauge(chat) {
-    const gauge = this.$("#ctx-gauge");
+  _contextStats(chat) {
     const limit = this._serverConfig?.context_window || 32768;
+    const usage = chat?.usage;
+    const prompt = usage?.prompt_tokens ?? null;
+    const completion = usage?.completion_tokens ?? null;
     let used = null;
     let estimated = false;
-    const usage = chat?.usage;
     if (usage?.total_tokens) {
       used = usage.total_tokens;
-    } else if (usage?.prompt_tokens) {
-      used = usage.prompt_tokens + (usage.completion_tokens || 0);
+    } else if (prompt != null) {
+      used = prompt + (completion || 0);
     }
     if (used == null) {
       estimated = true;
@@ -1036,13 +1047,19 @@ class HaChatPanel extends HTMLElement {
       used = Math.round((text.length + SYSTEM_PROMPT.length) / 4);
     }
     const pct = Math.min(100, Math.round((used / limit) * 100));
+    return { limit, used, estimated, pct, prompt, completion };
+  }
+
+  _renderGauge(chat) {
+    const gauge = this.$("#ctx-gauge");
+    const { limit, used, estimated, pct } = this._contextStats(chat);
     const color =
       pct >= 90
         ? "var(--error-color, #db4437)"
         : pct >= 70
           ? "var(--warning-color, #ffa600)"
           : "var(--success-color, #0f9d58)";
-    gauge.title = `Context: ${estimated ? "~" : ""}${used.toLocaleString()} / ${limit.toLocaleString()} tokens (${pct}%)`;
+    gauge.title = `Context: ${estimated ? "~" : ""}${used.toLocaleString()} / ${limit.toLocaleString()} tokens (${pct}%) — click for details`;
     // Ring circumference for r=15.5 is ~97.4.
     const dash = ((pct / 100) * 97.4).toFixed(1);
     gauge.innerHTML = `
@@ -1052,6 +1069,35 @@ class HaChatPanel extends HTMLElement {
           d="M18 2.5 a 15.5 15.5 0 0 1 0 31 a 15.5 15.5 0 0 1 0 -31"/>
         <text x="18" y="22" text-anchor="middle" class="ring-text">${pct}</text>
       </svg>`;
+  }
+
+  _toggleCtxPopover() {
+    const popover = this.$("#ctx-popover");
+    if (!popover.hasAttribute("hidden")) {
+      popover.setAttribute("hidden", "");
+      return;
+    }
+    const stats = this._contextStats(this._currentChat());
+    const approx = stats.estimated ? "~" : "";
+    const fmt = (n) => (n == null ? "—" : n.toLocaleString());
+    const remaining = Math.max(0, stats.limit - stats.used);
+    popover.innerHTML = `
+      <h3>Context usage</h3>
+      <div class="kv"><span>Prompt tokens</span><span>${approx}${fmt(
+        stats.prompt ?? (stats.estimated ? stats.used : null)
+      )}</span></div>
+      <div class="kv"><span>Last response</span><span>${fmt(stats.completion)}</span></div>
+      <div class="kv"><span>Total used</span><span>${approx}${fmt(stats.used)}</span></div>
+      <div class="kv"><span>Context window</span><span>${fmt(stats.limit)}</span></div>
+      <div class="kv"><span>Remaining</span><span>${approx}${fmt(remaining)}</span></div>
+      <div class="ctx-bar"><div class="ctx-bar-fill" style="width:${stats.pct}%"></div></div>
+      <div class="kv"><span>Utilization</span><span>${stats.pct}%</span></div>
+      ${
+        stats.estimated
+          ? '<p class="muted small">No token counts reported yet — estimated from text length. Updates with real numbers after each response.</p>'
+          : '<p class="muted small">Reported by the LLM server after the last response.</p>'
+      }`;
+    popover.removeAttribute("hidden");
   }
 
   /* ---------- settings dialog ---------- */
@@ -1194,12 +1240,43 @@ const STYLES = `
     font-size: 14px;
   }
   .chat-time { font-size: 11px; color: var(--secondary-text-color, #727272); }
-  .chat-del { visibility: hidden; font-size: 13px; }
+  .chat-del { visibility: hidden; line-height: 0; }
+  .chat-del ha-icon { --mdc-icon-size: 17px; }
   .chat-item:hover .chat-del { visibility: visible; }
+  .chat-del:hover { color: var(--error-color, #db4437); }
 
   #scrim { display: none; }
 
-  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
+
+  #ctx-popover[hidden] { display: none; }
+  #ctx-popover {
+    position: absolute;
+    bottom: 78px;
+    right: 16px;
+    z-index: 5;
+    width: 280px;
+    background: var(--card-background-color, #fff);
+    border: 1px solid var(--divider-color, #e0e0e0);
+    border-radius: 12px;
+    padding: 12px 16px;
+    box-shadow: 0 6px 24px rgba(0,0,0,0.18);
+    font-size: 13px;
+  }
+  #ctx-popover h3 { margin: 0 0 8px; font-size: 14px; }
+  #ctx-popover p { margin: 8px 0 0; }
+  .ctx-bar {
+    height: 6px;
+    border-radius: 3px;
+    background: var(--secondary-background-color, #f0f0f0);
+    margin: 8px 0 4px;
+    overflow: hidden;
+  }
+  .ctx-bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    background: var(--primary-color, #03a9f4);
+  }
   #header {
     display: flex;
     align-items: center;
@@ -1409,7 +1486,7 @@ const STYLES = `
     width: 38px;
     height: 38px;
     flex: none;
-    cursor: default;
+    cursor: pointer;
   }
   #ctx-gauge svg { width: 100%; height: 100%; }
   #ctx-gauge .ring-bg {
@@ -1427,7 +1504,12 @@ const STYLES = `
     fill: var(--secondary-text-color, #727272);
   }
   #send { min-width: 48px; height: 40px; }
-  #send.stop { background: var(--error-color, #db4437); }
+  #send.stop {
+    background: var(--error-color, #db4437);
+    font-size: 24px;
+    line-height: 1;
+    padding: 0 16px;
+  }
 
   /* narrow / mobile */
   #layout.narrow #sidebar {
