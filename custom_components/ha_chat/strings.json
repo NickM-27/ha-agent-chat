@@ -18,7 +18,7 @@
           "llm_api_key": "Sent as a Bearer token if your LLM server requires one",
           "mcp_url": "ha-mcp connect URL (http://...:9584/private_xxx) or a ws:// MCP endpoint",
           "mcp_token": "Only needed if your MCP server requires Authorization",
-          "context_window": "Your model's context length; drives the utilization gauge in the chat panel"
+          "context_window": "Fallback for the utilization gauge, used only when the context length can't be detected from the LLM server"
         }
       }
     },

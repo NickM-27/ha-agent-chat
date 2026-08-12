@@ -18,6 +18,57 @@ class LLMError(Exception):
     """The LLM endpoint failed or returned an unexpected response."""
 
 
+async def async_detect_context_window(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    model: str,
+    api_key: str | None = None,
+) -> int | None:
+    """Try to read the model's context length from the /models endpoint.
+
+    Nonstandard but widely available: llama.cpp reports meta.n_ctx,
+    LM Studio max_context_length, vLLM max_model_len.
+    """
+    url = base_url.rstrip("/") + "/models"
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        async with session.get(
+            url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json(content_type=None)
+    except (aiohttp.ClientError, OSError, ValueError, TimeoutError):
+        return None
+
+    entries = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(entries, list):
+        return None
+    match = None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("id") == model or model in (entry.get("aliases") or []):
+            match = entry
+            break
+    if match is None:
+        return None
+    meta = match.get("meta") or {}
+    for value in (
+        match.get("max_context_length"),  # LM Studio
+        match.get("max_model_len"),  # vLLM
+        match.get("context_length"),
+        match.get("context_window"),
+        meta.get("n_ctx"),  # llama.cpp: the context actually being served
+        meta.get("n_ctx_train"),
+    ):
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
+
+
 async def async_stream_chat_completion(
     session: aiohttp.ClientSession,
     base_url: str,

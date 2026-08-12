@@ -639,11 +639,11 @@ class HaChatPanel extends HTMLElement {
           </div>
           <div id="banner-area"></div>
           <div id="messages"></div>
-          <div id="ctx-popover" hidden></div>
           <div id="composer">
             <textarea id="input" rows="1" placeholder="Message…"></textarea>
             <div id="ctx-gauge" title="Context utilization"></div>
             <button id="send" class="primary" title="Send">➤</button>
+            <div id="ctx-popover" hidden></div>
           </div>
         </div>
       </div>
@@ -1117,8 +1117,13 @@ class HaChatPanel extends HTMLElement {
       ${
         stats.estimated
           ? '<p class="muted small">No token counts reported yet — estimated from text length. Updates with real numbers after each response.</p>'
-          : '<p class="muted small">Reported by the LLM server after the last response.</p>'
-      }`;
+          : '<p class="muted small">Token counts reported by the LLM server after the last response.</p>'
+      }
+      <p class="muted small">${
+        this._serverConfig?.context_window_source === "detected"
+          ? "Context window detected from the LLM server."
+          : "Context window from the integration settings."
+      }</p>`;
     popover.removeAttribute("hidden");
   }
 
@@ -1269,15 +1274,16 @@ const STYLES = `
 
   #scrim { display: none; }
 
-  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 
   #ctx-popover[hidden] { display: none; }
   #ctx-popover {
     position: absolute;
-    bottom: 78px;
-    right: 16px;
+    bottom: calc(100% + 10px);
+    right: 48px;
     z-index: 5;
     width: 280px;
+    max-width: calc(100vw - 24px);
     background: var(--card-background-color, #fff);
     border: 1px solid var(--divider-color, #e0e0e0);
     border-radius: 12px;
@@ -1481,6 +1487,7 @@ const STYLES = `
   @keyframes blink { 0%, 80%, 100% { opacity: 0.25; } 40% { opacity: 1; } }
 
   #composer {
+    position: relative;
     display: flex;
     gap: 8px;
     align-items: flex-end;

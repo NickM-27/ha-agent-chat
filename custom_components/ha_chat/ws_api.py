@@ -26,7 +26,12 @@ from .const import (
     WS_TYPE_CONFIG,
     WS_TYPE_TOOLS,
 )
-from .llm import LLMError, async_chat_completion, async_stream_chat_completion
+from .llm import (
+    LLMError,
+    async_chat_completion,
+    async_detect_context_window,
+    async_stream_chat_completion,
+)
 from .mcp_client import MCPError, extract_tool_text
 
 _LOGGER = logging.getLogger(__name__)
@@ -94,13 +99,21 @@ async def ws_config(
         connection.send_error(msg["id"], "not_ready", "HA Chat is not set up")
         return
     conf = _conf(runtime)
+    detected = await async_detect_context_window(
+        async_get_clientsession(hass),
+        conf[CONF_LLM_URL],
+        conf[CONF_LLM_MODEL],
+        conf.get(CONF_LLM_API_KEY),
+    )
     connection.send_result(
         msg["id"],
         {
             "model": conf.get(CONF_LLM_MODEL),
             "llm_url": conf.get(CONF_LLM_URL),
             "mcp_url": conf.get(CONF_MCP_URL),
-            "context_window": conf.get(CONF_CONTEXT_WINDOW, DEFAULT_CONTEXT_WINDOW),
+            "context_window": detected
+            or conf.get(CONF_CONTEXT_WINDOW, DEFAULT_CONTEXT_WINDOW),
+            "context_window_source": "detected" if detected else "configured",
         },
     )
 
