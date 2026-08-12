@@ -247,6 +247,8 @@ class HaChatPanel extends HTMLElement {
     this._toolsError = null;
     this._streamText = "";
     this._streamRaf = null;
+    this._streamStart = null;
+    this._streamChunks = 0;
     this._unsubStream = null;
     this._stopCurrent = null;
 
@@ -393,6 +395,8 @@ class HaChatPanel extends HTMLElement {
     this._busy = true;
     this._error = null;
     this._streamText = "";
+    this._streamStart = null;
+    this._streamChunks = 0;
     this._render();
 
     let unsub = null;
@@ -450,6 +454,8 @@ class HaChatPanel extends HTMLElement {
 
     const onEvent = (ev) => {
       if (ev.type === "delta") {
+        if (this._streamStart === null) this._streamStart = performance.now();
+        this._streamChunks += 1;
         this._streamText += ev.content;
         this._renderStream();
       } else if (ev.type === "done") {
@@ -504,6 +510,15 @@ class HaChatPanel extends HTMLElement {
     }
   }
 
+  _liveStats() {
+    // Delta chunks roughly equal tokens; wait for a few before showing a rate.
+    if (!this._streamStart || this._streamChunks < 5) return "";
+    const seconds = (performance.now() - this._streamStart) / 1000;
+    if (seconds < 0.5) return "";
+    const rate = (this._streamChunks / seconds).toFixed(1);
+    return `~${rate} tok/s · ~${this._streamChunks} tokens`;
+  }
+
   _renderStream() {
     if (this._streamRaf) return;
     this._streamRaf = requestAnimationFrame(() => {
@@ -511,6 +526,8 @@ class HaChatPanel extends HTMLElement {
       const bubble = this.shadowRoot.querySelector("#stream-bubble");
       if (bubble) {
         bubble.innerHTML = renderMarkdown(this._streamText);
+        const meta = this.shadowRoot.querySelector("#stream-meta");
+        if (meta) meta.textContent = this._liveStats();
         const container = this.$("#messages");
         container.scrollTop = container.scrollHeight;
       } else {
@@ -902,6 +919,11 @@ class HaChatPanel extends HTMLElement {
         bubble.innerHTML = renderMarkdown(this._streamText);
         row.appendChild(bubble);
         container.appendChild(row);
+        const meta = document.createElement("div");
+        meta.className = "msg-meta";
+        meta.id = "stream-meta";
+        meta.textContent = this._liveStats();
+        container.appendChild(meta);
       } else {
         const typing = document.createElement("div");
         typing.className = "typing";
