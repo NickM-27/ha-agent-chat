@@ -428,6 +428,11 @@ class HaChatPanel extends HTMLElement {
     this.$("#settings-close").addEventListener("click", () =>
       this.$("#settings-overlay").setAttribute("hidden", "")
     );
+    this.$("#settings-overlay").addEventListener("click", (ev) => {
+      if (ev.target === ev.currentTarget) {
+        this.$("#settings-overlay").setAttribute("hidden", "");
+      }
+    });
 
     const input = this.$("#input");
     input.addEventListener("keydown", (ev) => {
@@ -1072,6 +1077,7 @@ const STYLES = `
   #layout.narrow .bubble, #layout.narrow .tool-card { max-width: 92%; }
 
   /* settings dialog */
+  #settings-overlay[hidden] { display: none; }
   #settings-overlay {
     position: fixed;
     inset: 0;
