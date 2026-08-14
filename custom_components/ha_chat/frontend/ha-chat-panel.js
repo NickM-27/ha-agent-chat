@@ -276,6 +276,13 @@ class HaChatPanel extends HTMLElement {
       this._buildUI();
       this._loadServerInfo();
       this._render();
+      // Older HA versions may not give the panel box a height; fall back to
+      // viewport units if we collapsed.
+      requestAnimationFrame(() => {
+        if (this.getBoundingClientRect().height < 100) {
+          this.style.height = "100dvh";
+        }
+      });
     }
   }
 
@@ -676,8 +683,8 @@ class HaChatPanel extends HTMLElement {
           <div id="banner-area"></div>
           <div id="messages"></div>
           <div id="composer">
+            <button id="reason-btn" hidden><ha-icon icon="mdi:thought-bubble-outline"></ha-icon></button>
             <textarea id="input" rows="1" placeholder="Message…"></textarea>
-            <button id="reason-btn" class="icon-btn" hidden><ha-icon icon="mdi:brain"></ha-icon></button>
             <div id="ctx-gauge" title="Context utilization"></div>
             <button id="send" class="primary" title="Send">➤</button>
             <div id="ctx-popover" hidden></div>
@@ -1260,8 +1267,9 @@ class HaChatPanel extends HTMLElement {
 const STYLES = `
   :host {
     display: block;
-    height: 100vh;
-    height: 100dvh; /* mobile: exclude browser chrome so nothing overflows */
+    /* Fill the panel box HA provides (like ha-panel-iframe does); viewport
+       units overflow on mobile where the panel box excludes browser chrome. */
+    height: 100%;
     overflow: hidden;
     background: var(--primary-background-color, #fafafa);
     color: var(--primary-text-color, #212121);
@@ -1598,14 +1606,23 @@ const STYLES = `
   #reason-btn[hidden] { display: none; }
   #reason-btn {
     flex: none;
-    height: 38px;
-    opacity: 0.35;
-    transition: opacity 0.15s ease, color 0.15s ease;
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    border: 1px solid var(--divider-color, #e0e0e0);
+    background: transparent;
+    color: var(--secondary-text-color, #727272);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    transition: background 0.15s ease, border-color 0.15s ease;
   }
-  #reason-btn ha-icon { --mdc-icon-size: 24px; }
+  #reason-btn ha-icon { --mdc-icon-size: 20px; }
   #reason-btn.active {
-    opacity: 1;
-    color: var(--primary-color, #03a9f4);
+    background: var(--primary-color, #03a9f4);
+    border-color: var(--primary-color, #03a9f4);
+    color: var(--text-primary-color, #fff);
   }
   #ctx-gauge {
     width: 38px;
