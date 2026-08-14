@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 import aiohttp
@@ -18,17 +19,76 @@ class LLMError(Exception):
     """The LLM endpoint failed or returned an unexpected response."""
 
 
-async def async_detect_context_window(
+_OFF_VALUES = ("off", "0", "false", "none", "disabled")
+
+
+def _detect_reasoning(entry: dict[str, Any]) -> tuple[bool, bool]:
+    """Best-effort reasoning detection from a model entry.
+
+    Returns (supports_reasoning, enabled_by_default).
+    """
+    supports = False
+    default_on = True
+
+    capabilities = entry.get("capabilities")
+    if isinstance(capabilities, list) and any(
+        cap in ("reasoning", "thinking") for cap in capabilities
+    ):
+        supports = True
+    if isinstance(capabilities, dict) and (
+        capabilities.get("reasoning") or capabilities.get("thinking")
+    ):
+        supports = True
+
+    meta = entry.get("meta") or {}
+    for source in (entry, meta):
+        for key in ("reasoning", "thinking", "supports_reasoning", "has_reasoning"):
+            if source.get(key) is True:
+                supports = True
+        template = source.get("chat_template")
+        if isinstance(template, str) and (
+            "<think>" in template or "enable_thinking" in template
+        ):
+            supports = True
+
+    # llama.cpp preset managers (llama-swap style) expose the launch config: a
+    # "--reasoning on/off" arg or "reasoning = ..." preset line marks the model
+    # as reasoning-capable and tells us the server-side default. The unrelated
+    # "--reasoning-budget-message" flag appears on every model, so match exactly.
+    status = entry.get("status") or {}
+    args = status.get("args")
+    if isinstance(args, list) and "--reasoning" in args:
+        supports = True
+        index = args.index("--reasoning")
+        if index + 1 < len(args):
+            default_on = str(args[index + 1]).lower() not in _OFF_VALUES
+    preset = status.get("preset")
+    if isinstance(preset, str):
+        match = re.search(r"^reasoning\s*=\s*(\S+)", preset, re.MULTILINE)
+        if match:
+            supports = True
+            default_on = match.group(1).lower() not in _OFF_VALUES
+
+    return supports, default_on
+
+
+async def async_probe_model(
     session: aiohttp.ClientSession,
     base_url: str,
     model: str,
     api_key: str | None = None,
-) -> int | None:
-    """Try to read the model's context length from the /models endpoint.
+) -> dict[str, Any]:
+    """Read model metadata from the /models endpoint.
 
-    Nonstandard but widely available: llama.cpp reports meta.n_ctx,
-    LM Studio max_context_length, vLLM max_model_len.
+    Returns {"context_window": int | None, "supports_reasoning": bool,
+    "reasoning_default": bool}. Nonstandard but widely available: llama.cpp
+    reports meta.n_ctx, LM Studio max_context_length, vLLM max_model_len.
     """
+    result: dict[str, Any] = {
+        "context_window": None,
+        "supports_reasoning": False,
+        "reasoning_default": True,
+    }
     url = base_url.rstrip("/") + "/models"
     headers = {}
     if api_key:
@@ -38,14 +98,14 @@ async def async_detect_context_window(
             url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
         ) as resp:
             if resp.status != 200:
-                return None
+                return result
             data = await resp.json(content_type=None)
     except (aiohttp.ClientError, OSError, ValueError, TimeoutError):
-        return None
+        return result
 
     entries = data.get("data") if isinstance(data, dict) else data
     if not isinstance(entries, list):
-        return None
+        return result
     match = None
     for entry in entries:
         if not isinstance(entry, dict):
@@ -54,7 +114,8 @@ async def async_detect_context_window(
             match = entry
             break
     if match is None:
-        return None
+        return result
+
     meta = match.get("meta") or {}
     for value in (
         match.get("max_context_length"),  # LM Studio
@@ -65,8 +126,12 @@ async def async_detect_context_window(
         meta.get("n_ctx_train"),
     ):
         if isinstance(value, int) and value > 0:
-            return value
-    return None
+            result["context_window"] = value
+            break
+    supports, default_on = _detect_reasoning(match)
+    result["supports_reasoning"] = supports
+    result["reasoning_default"] = default_on
+    return result
 
 
 async def async_stream_chat_completion(
@@ -76,6 +141,7 @@ async def async_stream_chat_completion(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
     api_key: str | None = None,
+    reasoning: bool | None = None,
 ):
     """Yield parsed SSE chunks from a streaming chat completion."""
     url = base_url.rstrip("/") + "/chat/completions"
@@ -92,9 +158,20 @@ async def async_stream_chat_completion(
     }
     if tools:
         payload["tools"] = tools
+    if reasoning is False:
+        # llama.cpp honors reasoning_effort "none"; Qwen-style templates
+        # (llama.cpp, vLLM) honor enable_thinking=False.
+        payload["reasoning_effort"] = "none"
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    elif reasoning is True:
+        # Explicit enable so the toggle can override a server-side default of off.
+        payload["chat_template_kwargs"] = {"enable_thinking": True}
 
+    # Nonstandard fields some servers reject with a 400; drop the ones the
+    # error message names and retry.
+    optional_fields = ["stream_options", "chat_template_kwargs", "reasoning_effort"]
     resp: aiohttp.ClientResponse | None = None
-    for attempt in (0, 1):
+    for _ in range(len(optional_fields) + 1):
         try:
             resp = await session.post(
                 url, json=payload, headers=headers, timeout=LLM_TIMEOUT
@@ -105,10 +182,15 @@ async def async_stream_chat_completion(
             break
         body = await resp.text()
         resp.close()
-        if attempt == 0 and resp.status == 400 and "stream_options" in body:
-            # Server rejects stream_options; drop it and retry once.
-            payload.pop("stream_options", None)
-            continue
+        if resp.status == 400:
+            dropped = False
+            for field in list(optional_fields):
+                if field in payload and field in body:
+                    payload.pop(field)
+                    optional_fields.remove(field)
+                    dropped = True
+            if dropped:
+                continue
         raise LLMError(f"LLM returned HTTP {resp.status}: {body[:500]}")
 
     try:

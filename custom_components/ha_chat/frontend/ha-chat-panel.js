@@ -7,6 +7,7 @@
 
 const STORAGE_CHATS = "ha-chat:chats:v1";
 const STORAGE_AUTO_APPROVE = "ha-chat:auto-approve:v1";
+const STORAGE_REASONING = "ha-chat:reasoning:v1";
 const MAX_AUTO_TURNS = 15;
 
 const SYSTEM_PROMPT = [
@@ -246,11 +247,14 @@ class HaChatPanel extends HTMLElement {
     this._tools = null;
     this._toolsError = null;
     this._streamText = "";
+    this._streamThink = "";
     this._streamRaf = null;
     this._streamStart = null;
     this._streamChunks = 0;
     this._unsubStream = null;
     this._stopCurrent = null;
+    // null = follow the server's default until the user flips the toggle.
+    this._reasoningPref = loadJson(STORAGE_REASONING, null);
 
     this.chats = loadJson(STORAGE_CHATS, []);
     this.autoApprove = new Set(loadJson(STORAGE_AUTO_APPROVE, []));
@@ -289,6 +293,11 @@ class HaChatPanel extends HTMLElement {
 
   _ws(message) {
     return this._hass.connection.sendMessagePromise(message);
+  }
+
+  _reasoningOn() {
+    if (this._reasoningPref !== null) return this._reasoningPref;
+    return this._serverConfig?.reasoning_default ?? true;
   }
 
   async _loadServerInfo() {
@@ -395,6 +404,7 @@ class HaChatPanel extends HTMLElement {
     this._busy = true;
     this._error = null;
     this._streamText = "";
+    this._streamThink = "";
     this._streamStart = null;
     this._streamChunks = 0;
     this._render();
@@ -419,6 +429,7 @@ class HaChatPanel extends HTMLElement {
       finished = true;
       this._busy = false;
       this._streamText = "";
+      this._streamThink = "";
       cleanup();
       if (!message) {
         this._render();
@@ -458,6 +469,11 @@ class HaChatPanel extends HTMLElement {
         this._streamChunks += 1;
         this._streamText += ev.content;
         this._renderStream();
+      } else if (ev.type === "think") {
+        if (this._streamStart === null) this._streamStart = performance.now();
+        this._streamChunks += 1;
+        this._streamThink += ev.content;
+        this._renderStream();
       } else if (ev.type === "done") {
         this._warning = ev.warning || null;
         finalize(ev.message, {
@@ -466,6 +482,7 @@ class HaChatPanel extends HTMLElement {
           estimated: ev.estimated,
           elapsed: ev.elapsed,
           usage: ev.usage || null,
+          think: ev.reasoning || null,
         });
       } else if (ev.type === "error") {
         this._error = ev.error || "Request failed";
@@ -486,18 +503,19 @@ class HaChatPanel extends HTMLElement {
       );
     };
 
+    const request = {
+      type: "ha_chat/chat_stream",
+      messages: [{ role: "system", content: SYSTEM_PROMPT }, ...chat.messages],
+    };
+    // Only steer reasoning for models that support it; otherwise leave the
+    // request untouched.
+    if (this._serverConfig?.supports_reasoning) {
+      request.reasoning = this._reasoningOn();
+    }
     try {
-      unsub = await this._hass.connection.subscribeMessage(
-        onEvent,
-        {
-          type: "ha_chat/chat_stream",
-          messages: [
-            { role: "system", content: SYSTEM_PROMPT },
-            ...chat.messages,
-          ],
-        },
-        { resubscribe: false }
-      );
+      unsub = await this._hass.connection.subscribeMessage(onEvent, request, {
+        resubscribe: false,
+      });
       this._unsubStream = unsub;
       // The user hit stop before the subscription resolved.
       if (finished) cleanup();
@@ -519,20 +537,38 @@ class HaChatPanel extends HTMLElement {
     return `~${rate} tok/s · ~${this._streamChunks} tokens`;
   }
 
+  _thinkBlock(text, streaming) {
+    const details = document.createElement("details");
+    details.className = "think-box";
+    if (streaming) details.id = "stream-think";
+    const summary = document.createElement("summary");
+    summary.textContent = streaming ? "Thinking…" : "Thinking";
+    const body = document.createElement("div");
+    body.className = "think-content";
+    body.textContent = text;
+    details.append(summary, body);
+    return details;
+  }
+
   _renderStream() {
     if (this._streamRaf) return;
     this._streamRaf = requestAnimationFrame(() => {
       this._streamRaf = null;
-      const bubble = this.shadowRoot.querySelector("#stream-bubble");
-      if (bubble) {
-        bubble.innerHTML = renderMarkdown(this._streamText);
-        const meta = this.shadowRoot.querySelector("#stream-meta");
-        if (meta) meta.textContent = this._liveStats();
-        const container = this.$("#messages");
-        container.scrollTop = container.scrollHeight;
-      } else {
+      const needFull =
+        (this._streamText && !this.shadowRoot.querySelector("#stream-bubble")) ||
+        (this._streamThink && !this.shadowRoot.querySelector("#stream-think"));
+      if (needFull) {
         this._render();
+        return;
       }
+      const bubble = this.shadowRoot.querySelector("#stream-bubble");
+      if (bubble) bubble.innerHTML = renderMarkdown(this._streamText);
+      const think = this.shadowRoot.querySelector("#stream-think .think-content");
+      if (think) think.textContent = this._streamThink;
+      const meta = this.shadowRoot.querySelector("#stream-meta");
+      if (meta) meta.textContent = this._liveStats();
+      const container = this.$("#messages");
+      container.scrollTop = container.scrollHeight;
     });
   }
 
@@ -641,6 +677,7 @@ class HaChatPanel extends HTMLElement {
           <div id="messages"></div>
           <div id="composer">
             <textarea id="input" rows="1" placeholder="Message…"></textarea>
+            <button id="reason-btn" class="icon-btn" hidden><ha-icon icon="mdi:brain"></ha-icon></button>
             <div id="ctx-gauge" title="Context utilization"></div>
             <button id="send" class="primary" title="Send">➤</button>
             <div id="ctx-popover" hidden></div>
@@ -678,6 +715,11 @@ class HaChatPanel extends HTMLElement {
       }
     });
     this.$("#ctx-gauge").addEventListener("click", () => this._toggleCtxPopover());
+    this.$("#reason-btn").addEventListener("click", () => {
+      this._reasoningPref = !this._reasoningOn();
+      saveJson(STORAGE_REASONING, this._reasoningPref);
+      this._renderComposerState();
+    });
     this.shadowRoot.addEventListener("click", (ev) => {
       const popover = this.$("#ctx-popover");
       if (popover.hasAttribute("hidden")) return;
@@ -868,6 +910,9 @@ class HaChatPanel extends HTMLElement {
       }
 
       // assistant
+      if (message._ui?.think) {
+        container.appendChild(this._thinkBlock(message._ui.think, false));
+      }
       const text = contentToText(message.content);
       if (text && text.replace(/<think>[\s\S]*?<\/think>/g, "").trim()) {
         const row = document.createElement("div");
@@ -910,6 +955,9 @@ class HaChatPanel extends HTMLElement {
     }
 
     if (this._busy) {
+      if (this._streamThink) {
+        container.appendChild(this._thinkBlock(this._streamThink, true));
+      }
       if (this._streamText) {
         const row = document.createElement("div");
         row.className = "msg-row assistant";
@@ -919,16 +967,18 @@ class HaChatPanel extends HTMLElement {
         bubble.innerHTML = renderMarkdown(this._streamText);
         row.appendChild(bubble);
         container.appendChild(row);
+      } else if (!this._streamThink) {
+        const typing = document.createElement("div");
+        typing.className = "typing";
+        typing.innerHTML = "<span></span><span></span><span></span>";
+        container.appendChild(typing);
+      }
+      if (this._streamText || this._streamThink) {
         const meta = document.createElement("div");
         meta.className = "msg-meta";
         meta.id = "stream-meta";
         meta.textContent = this._liveStats();
         container.appendChild(meta);
-      } else {
-        const typing = document.createElement("div");
-        typing.className = "typing";
-        typing.innerHTML = "<span></span><span></span><span></span>";
-        container.appendChild(typing);
       }
     }
 
@@ -1043,6 +1093,17 @@ class HaChatPanel extends HTMLElement {
     send.title = this._busy ? "Stop generating" : "Send";
     send.classList.toggle("stop", this._busy);
     send.disabled = !this._busy && (this._executing || !!chat?.pending);
+    const reason = this.$("#reason-btn");
+    if (this._serverConfig?.supports_reasoning) {
+      reason.removeAttribute("hidden");
+      const on = this._reasoningOn();
+      reason.classList.toggle("active", on);
+      reason.title = on
+        ? "Reasoning on — click to disable"
+        : "Reasoning off — click to enable";
+    } else {
+      reason.setAttribute("hidden", "");
+    }
     input.placeholder = chat?.pending
       ? "Resolve the pending tool calls first…"
       : this._busy
@@ -1200,6 +1261,8 @@ const STYLES = `
   :host {
     display: block;
     height: 100vh;
+    height: 100dvh; /* mobile: exclude browser chrome so nothing overflows */
+    overflow: hidden;
     background: var(--primary-background-color, #fafafa);
     color: var(--primary-text-color, #212121);
     font-family: var(--paper-font-body1_-_font-family, Roboto, sans-serif);
@@ -1440,6 +1503,27 @@ const STYLES = `
     margin: -6px 0 0 6px;
   }
 
+  .think-box {
+    max-width: 78%;
+    border: 1px dashed var(--divider-color, #e0e0e0);
+    border-radius: 10px;
+    padding: 6px 12px;
+    font-size: 12px;
+    color: var(--secondary-text-color, #727272);
+  }
+  .think-box summary {
+    cursor: pointer;
+    font-style: italic;
+    user-select: none;
+  }
+  .think-content {
+    margin-top: 6px;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+
   .tool-card {
     border: 1px solid var(--divider-color, #e0e0e0);
     background: var(--card-background-color, #fff);
@@ -1511,6 +1595,18 @@ const STYLES = `
     max-height: 160px;
   }
   #input:focus { border-color: var(--primary-color, #03a9f4); }
+  #reason-btn[hidden] { display: none; }
+  #reason-btn {
+    flex: none;
+    height: 38px;
+    opacity: 0.35;
+    transition: opacity 0.15s ease, color 0.15s ease;
+  }
+  #reason-btn ha-icon { --mdc-icon-size: 24px; }
+  #reason-btn.active {
+    opacity: 1;
+    color: var(--primary-color, #03a9f4);
+  }
   #ctx-gauge {
     width: 38px;
     height: 38px;

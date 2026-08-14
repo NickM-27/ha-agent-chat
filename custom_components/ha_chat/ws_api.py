@@ -29,7 +29,7 @@ from .const import (
 from .llm import (
     LLMError,
     async_chat_completion,
-    async_detect_context_window,
+    async_probe_model,
     async_stream_chat_completion,
 )
 from .mcp_client import MCPError, extract_tool_text
@@ -99,12 +99,13 @@ async def ws_config(
         connection.send_error(msg["id"], "not_ready", "HA Chat is not set up")
         return
     conf = _conf(runtime)
-    detected = await async_detect_context_window(
+    probe = await async_probe_model(
         async_get_clientsession(hass),
         conf[CONF_LLM_URL],
         conf[CONF_LLM_MODEL],
         conf.get(CONF_LLM_API_KEY),
     )
+    detected = probe["context_window"]
     connection.send_result(
         msg["id"],
         {
@@ -114,6 +115,8 @@ async def ws_config(
             "context_window": detected
             or conf.get(CONF_CONTEXT_WINDOW, DEFAULT_CONTEXT_WINDOW),
             "context_window_source": "detected" if detected else "configured",
+            "supports_reasoning": probe["supports_reasoning"],
+            "reasoning_default": probe["reasoning_default"],
         },
     )
 
@@ -207,6 +210,8 @@ async def ws_chat(
     {
         vol.Required("type"): WS_TYPE_CHAT_STREAM,
         vol.Required("messages"): [dict],
+        # True/False force reasoning on/off; omitted leaves the server default.
+        vol.Optional("reasoning"): vol.Any(bool, None),
     }
 )
 @websocket_api.async_response
@@ -245,6 +250,7 @@ async def ws_chat_stream(
         started = time.monotonic()
         first_token: float | None = None
         content_parts: list[str] = []
+        think_parts: list[str] = []
         tool_calls: dict[int, dict[str, Any]] = {}
         usage: dict[str, Any] | None = None
         chunk_count = 0
@@ -256,6 +262,7 @@ async def ws_chat_stream(
                 messages,
                 tools=tools or None,
                 api_key=conf.get(CONF_LLM_API_KEY),
+                reasoning=msg.get("reasoning"),
             )
             async for chunk in stream:
                 if chunk.get("usage"):
@@ -264,6 +271,13 @@ async def ws_chat_stream(
                 if not choices:
                     continue
                 delta = choices[0].get("delta") or {}
+                thinking = delta.get("reasoning_content") or delta.get("reasoning")
+                if isinstance(thinking, str) and thinking:
+                    if first_token is None:
+                        first_token = time.monotonic()
+                    chunk_count += 1
+                    think_parts.append(thinking)
+                    _send_event({"type": "think", "content": thinking})
                 content = delta.get("content")
                 if content:
                     if first_token is None:
@@ -325,6 +339,8 @@ async def ws_chat_stream(
             "elapsed": round(now - started, 2),
             "token_rate": token_rate,
         }
+        if think_parts:
+            payload["reasoning"] = "".join(think_parts)
         if warning:
             payload["warning"] = warning
         _send_event(payload)
