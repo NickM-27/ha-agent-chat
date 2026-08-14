@@ -267,6 +267,26 @@ class HaChatPanel extends HTMLElement {
       }
     }
     this.currentId = this.chats.length ? this.chats[0].id : null;
+
+    // Pin the panel to the real visible viewport. HA gives custom panels no
+    // definite height, and viewport units miss browser chrome / safe areas /
+    // the on-screen keyboard; visualViewport is the ground truth.
+    this._updateHeight = () => {
+      const viewport = window.visualViewport;
+      const height = viewport ? viewport.height : window.innerHeight;
+      this.style.height = `${Math.round(height)}px`;
+    };
+  }
+
+  connectedCallback() {
+    this._updateHeight();
+    window.addEventListener("resize", this._updateHeight);
+    window.visualViewport?.addEventListener("resize", this._updateHeight);
+  }
+
+  disconnectedCallback() {
+    window.removeEventListener("resize", this._updateHeight);
+    window.visualViewport?.removeEventListener("resize", this._updateHeight);
   }
 
   set hass(hass) {
@@ -276,13 +296,7 @@ class HaChatPanel extends HTMLElement {
       this._buildUI();
       this._loadServerInfo();
       this._render();
-      // Older HA versions may not give the panel box a height; fall back to
-      // viewport units if we collapsed.
-      requestAnimationFrame(() => {
-        if (this.getBoundingClientRect().height < 100) {
-          this.style.height = "100dvh";
-        }
-      });
+      this._updateHeight();
     }
   }
 
@@ -1267,9 +1281,10 @@ class HaChatPanel extends HTMLElement {
 const STYLES = `
   :host {
     display: block;
-    /* Fill the panel box HA provides (like ha-panel-iframe does); viewport
-       units overflow on mobile where the panel box excludes browser chrome. */
-    height: 100%;
+    /* Fallback only: JS pins the host to the measured viewport height,
+       which is the only reliable size across desktop, mobile Safari, and
+       the companion app. */
+    height: 100vh;
     overflow: hidden;
     background: var(--primary-background-color, #fafafa);
     color: var(--primary-text-color, #212121);

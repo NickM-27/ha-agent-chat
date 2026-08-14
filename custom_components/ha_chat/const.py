@@ -1,7 +1,7 @@
 """Constants for the HA Chat integration."""
 
 DOMAIN = "ha_chat"
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 CONF_LLM_URL = "llm_base_url"
 CONF_LLM_API_KEY = "llm_api_key"
