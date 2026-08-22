@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 
@@ -20,7 +21,6 @@ from .const import (
     PANEL_TITLE,
     PANEL_URL_PATH,
     STATIC_URL_BASE,
-    VERSION,
 )
 from .mcp_client import create_mcp_client
 
@@ -29,6 +29,18 @@ _LOGGER = logging.getLogger(__name__)
 _KEY_WS_REGISTERED = "_ws_registered"
 _KEY_STATIC_REGISTERED = "_static_registered"
 _KEY_PANEL_REGISTERED = "_panel_registered"
+
+_FRONTEND_DIR = Path(__file__).parent / "frontend"
+_PANEL_FILE = _FRONTEND_DIR / "ha-chat-panel.js"
+
+
+def _panel_cache_key() -> str:
+    """Short hash of the panel source, used as a cache-busting query param.
+
+    Computed at setup so every change to the JS file gets a fresh URL without
+    having to remember to bump a version constant.
+    """
+    return hashlib.sha256(_PANEL_FILE.read_bytes()).hexdigest()[:12]
 
 
 def get_config(entry: ConfigEntry) -> dict:
@@ -61,7 +73,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             [
                 StaticPathConfig(
                     STATIC_URL_BASE,
-                    str(Path(__file__).parent / "frontend"),
+                    str(_FRONTEND_DIR),
                     False,
                 )
             ]
@@ -69,11 +81,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         domain_data[_KEY_STATIC_REGISTERED] = True
 
     if not domain_data.get(_KEY_PANEL_REGISTERED):
+        cache_key = await hass.async_add_executor_job(_panel_cache_key)
         await panel_custom.async_register_panel(
             hass,
             webcomponent_name=PANEL_COMPONENT,
             frontend_url_path=PANEL_URL_PATH,
-            module_url=f"{STATIC_URL_BASE}/ha-chat-panel.js?v={VERSION}",
+            module_url=f"{STATIC_URL_BASE}/ha-chat-panel.js?v={cache_key}",
             sidebar_title=PANEL_TITLE,
             sidebar_icon=PANEL_ICON,
             require_admin=True,
