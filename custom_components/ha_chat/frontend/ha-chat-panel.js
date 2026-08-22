@@ -267,6 +267,8 @@ class HaChatPanel extends HTMLElement {
         }
       }
     }
+    // Drop empty chats left over from before chats were created lazily.
+    this.chats = this.chats.filter((chat) => chat.messages.length);
     this.currentId = this.chats.length ? this.chats[0].id : null;
 
     // Pin the panel to the real visible viewport. HA gives custom panels no
@@ -358,6 +360,17 @@ class HaChatPanel extends HTMLElement {
   }
 
   _newChat() {
+    // Just show the blank welcome view; the chat record is created when the
+    // first message is sent (see _sendUserMessage).
+    this.currentId = null;
+    this._sidebarOpen = false;
+    this._error = null;
+    this._warning = null;
+    this._render();
+    this._focusInput();
+  }
+
+  _createChat() {
     const chat = {
       id: uid(),
       title: "New chat",
@@ -369,12 +382,7 @@ class HaChatPanel extends HTMLElement {
     };
     this.chats.unshift(chat);
     this.currentId = chat.id;
-    this._sidebarOpen = false;
-    this._error = null;
-    this._warning = null;
-    this._save();
-    this._render();
-    this._focusInput();
+    return chat;
   }
 
   _deleteChat(id) {
@@ -406,11 +414,7 @@ class HaChatPanel extends HTMLElement {
   /* ---------- conversation loop ---------- */
 
   async _sendUserMessage(text) {
-    let chat = this._currentChat();
-    if (!chat) {
-      this._newChat();
-      chat = this._currentChat();
-    }
+    const chat = this._currentChat() || this._createChat();
     if (chat.messages.length === 0) {
       chat.title = text.length > 42 ? `${text.slice(0, 42)}…` : text;
     }
