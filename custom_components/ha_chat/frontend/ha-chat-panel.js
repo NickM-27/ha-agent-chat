@@ -241,6 +241,7 @@ class HaChatPanel extends HTMLElement {
     this._busy = false;
     this._executing = false;
     this._autoTurns = 0;
+    this._pausedChatId = null;
     this._error = null;
     this._warning = null;
     this._serverConfig = null;
@@ -415,6 +416,7 @@ class HaChatPanel extends HTMLElement {
     }
     chat.messages.push({ role: "user", content: text });
     this._autoTurns = 0;
+    this._pausedChatId = null;
     this._touch(chat);
     this._save();
     this._render();
@@ -667,11 +669,19 @@ class HaChatPanel extends HTMLElement {
 
     this._autoTurns += 1;
     if (this._autoTurns >= MAX_AUTO_TURNS) {
-      this._error = `Stopped after ${MAX_AUTO_TURNS} consecutive tool rounds. Send a message to continue.`;
+      this._pausedChatId = chat.id;
       this._render();
       return;
     }
     await this._runLLM(chat);
+  }
+
+  async _continuePaused() {
+    const chat = this.chats.find((c) => c.id === this._pausedChatId);
+    this._pausedChatId = null;
+    this._autoTurns = 0;
+    this._render();
+    if (chat) await this._runLLM(chat);
   }
 
   /* ---------- UI skeleton ---------- */
@@ -874,6 +884,19 @@ class HaChatPanel extends HTMLElement {
         this._render();
       });
       banner.append(span, close);
+      area.appendChild(banner);
+    }
+    const chat = this._currentChat();
+    if (chat && this._pausedChatId === chat.id && !this._busy) {
+      const banner = document.createElement("div");
+      banner.className = "banner banner-warn";
+      const span = document.createElement("span");
+      span.textContent = `Paused after ${MAX_AUTO_TURNS} consecutive tool rounds.`;
+      const cont = document.createElement("button");
+      cont.className = "primary banner-btn";
+      cont.textContent = "Continue";
+      cont.addEventListener("click", () => this._continuePaused());
+      banner.append(span, cont);
       area.appendChild(banner);
     }
   }
@@ -1426,6 +1449,7 @@ const STYLES = `
   }
   .banner-error { background: rgba(219, 68, 55, 0.12); color: var(--error-color, #b71c1c); }
   .banner-warn { background: rgba(255, 152, 0, 0.14); }
+  .banner-btn { padding: 4px 14px; font-size: 13px; }
 
   #messages {
     flex: 1;
