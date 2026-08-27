@@ -29,8 +29,9 @@ from .const import (
 from .llm import (
     LLMError,
     async_chat_completion,
-    async_probe_model,
+    async_fetch_models,
     async_stream_chat_completion,
+    probe_model_entry,
 )
 from .mcp_client import MCPError, extract_tool_text
 
@@ -77,6 +78,11 @@ def _sanitize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def _resolve_model(msg: dict, conf: dict[str, Any]) -> str | None:
+    """Model for this request: the panel's choice, else the legacy config value."""
+    return msg.get("model") or conf.get(CONF_LLM_MODEL)
+
+
 @callback
 def async_register_commands(hass: HomeAssistant) -> None:
     """Register the panel's websocket commands."""
@@ -88,28 +94,41 @@ def async_register_commands(hass: HomeAssistant) -> None:
 
 
 @websocket_api.require_admin
-@websocket_api.websocket_command({vol.Required("type"): WS_TYPE_CONFIG})
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_TYPE_CONFIG,
+        # The panel's selected model; omitted on first load.
+        vol.Optional("model"): str,
+    }
+)
 @websocket_api.async_response
 async def ws_config(
     hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
 ) -> None:
-    """Return the non-secret parts of the configuration for display."""
+    """Return the non-secret configuration plus the LLM server's model list."""
     runtime = _get_runtime(hass)
     if runtime is None:
         connection.send_error(msg["id"], "not_ready", "HA Chat is not set up")
         return
     conf = _conf(runtime)
-    probe = await async_probe_model(
+    entries = await async_fetch_models(
         async_get_clientsession(hass),
         conf[CONF_LLM_URL],
-        conf[CONF_LLM_MODEL],
         conf.get(CONF_LLM_API_KEY),
     )
+    models: list[str] = []
+    for entry in entries:
+        model_id = entry.get("id")
+        if isinstance(model_id, str) and model_id not in models:
+            models.append(model_id)
+    model = _resolve_model(msg, conf) or (models[0] if models else None)
+    probe = probe_model_entry(entries, model)
     detected = probe["context_window"]
     connection.send_result(
         msg["id"],
         {
-            "model": conf.get(CONF_LLM_MODEL),
+            "model": model,
+            "models": models,
             "llm_url": conf.get(CONF_LLM_URL),
             "mcp_url": conf.get(CONF_MCP_URL),
             "context_window": detected
@@ -162,6 +181,7 @@ async def ws_tools(
     {
         vol.Required("type"): WS_TYPE_CHAT,
         vol.Required("messages"): [dict],
+        vol.Optional("model"): str,
     }
 )
 @websocket_api.async_response
@@ -174,6 +194,10 @@ async def ws_chat(
         connection.send_error(msg["id"], "not_ready", "HA Chat is not set up")
         return
     conf = _conf(runtime)
+    model = _resolve_model(msg, conf)
+    if not model:
+        connection.send_error(msg["id"], "no_model", "No model selected")
+        return
 
     messages = _sanitize_messages(msg["messages"])
 
@@ -190,7 +214,7 @@ async def ws_chat(
         message = await async_chat_completion(
             async_get_clientsession(hass),
             conf[CONF_LLM_URL],
-            conf[CONF_LLM_MODEL],
+            model,
             messages,
             tools=tools or None,
             api_key=conf.get(CONF_LLM_API_KEY),
@@ -210,6 +234,7 @@ async def ws_chat(
     {
         vol.Required("type"): WS_TYPE_CHAT_STREAM,
         vol.Required("messages"): [dict],
+        vol.Optional("model"): str,
         # True/False force reasoning on/off; omitted leaves the server default.
         vol.Optional("reasoning"): vol.Any(bool, None),
     }
@@ -229,6 +254,10 @@ async def ws_chat_stream(
         connection.send_error(msg["id"], "not_ready", "HA Chat is not set up")
         return
     conf = _conf(runtime)
+    model = _resolve_model(msg, conf)
+    if not model:
+        connection.send_error(msg["id"], "no_model", "No model selected")
+        return
     messages = _sanitize_messages(msg["messages"])
     msg_id = msg["id"]
 
@@ -258,7 +287,7 @@ async def ws_chat_stream(
             stream = async_stream_chat_completion(
                 async_get_clientsession(hass),
                 conf[CONF_LLM_URL],
-                conf[CONF_LLM_MODEL],
+                model,
                 messages,
                 tools=tools or None,
                 api_key=conf.get(CONF_LLM_API_KEY),

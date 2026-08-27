@@ -6,7 +6,6 @@
         "description": "Connect a local OpenAI-compatible LLM and your ha-mcp server. These settings are stored server-side, so they apply on every device.",
         "data": {
           "llm_base_url": "LLM base URL",
-          "llm_model": "Model name",
           "llm_api_key": "LLM API key (optional)",
           "mcp_url": "MCP server URL",
           "mcp_token": "MCP bearer token (optional)",
@@ -14,7 +13,6 @@
         },
         "data_description": {
           "llm_base_url": "OpenAI-compatible base URL, e.g. http://192.168.1.10:11434/v1",
-          "llm_model": "Model to request, e.g. qwen3.8 27b",
           "llm_api_key": "Sent as a Bearer token if your LLM server requires one",
           "mcp_url": "ha-mcp connect URL (http://...:9584/private_xxx) or a ws:// MCP endpoint",
           "mcp_token": "Only needed if your MCP server requires Authorization",
@@ -36,7 +34,6 @@
         "title": "HA Chat settings",
         "data": {
           "llm_base_url": "LLM base URL",
-          "llm_model": "Model name",
           "llm_api_key": "LLM API key (optional)",
           "mcp_url": "MCP server URL",
           "mcp_token": "MCP bearer token (optional)",

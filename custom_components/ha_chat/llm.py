@@ -72,13 +72,34 @@ def _detect_reasoning(entry: dict[str, Any]) -> tuple[bool, bool]:
     return supports, default_on
 
 
-async def async_probe_model(
+async def async_fetch_models(
     session: aiohttp.ClientSession,
     base_url: str,
-    model: str,
     api_key: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return the raw model entries from the /models endpoint ([] on failure)."""
+    url = base_url.rstrip("/") + "/models"
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        async with session.get(
+            url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json(content_type=None)
+    except (aiohttp.ClientError, OSError, ValueError, TimeoutError):
+        return []
+
+    entries = data.get("data") if isinstance(data, dict) else data
+    return [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
+
+
+def probe_model_entry(
+    entries: list[dict[str, Any]], model: str | None
 ) -> dict[str, Any]:
-    """Read model metadata from the /models endpoint.
+    """Extract metadata for one model from /models entries.
 
     Returns {"context_window": int | None, "supports_reasoning": bool,
     "reasoning_default": bool}. Nonstandard but widely available: llama.cpp
@@ -89,27 +110,8 @@ async def async_probe_model(
         "supports_reasoning": False,
         "reasoning_default": True,
     }
-    url = base_url.rstrip("/") + "/models"
-    headers = {}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    try:
-        async with session.get(
-            url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
-        ) as resp:
-            if resp.status != 200:
-                return result
-            data = await resp.json(content_type=None)
-    except (aiohttp.ClientError, OSError, ValueError, TimeoutError):
-        return result
-
-    entries = data.get("data") if isinstance(data, dict) else data
-    if not isinstance(entries, list):
-        return result
     match = None
     for entry in entries:
-        if not isinstance(entry, dict):
-            continue
         if entry.get("id") == model or model in (entry.get("aliases") or []):
             match = entry
             break

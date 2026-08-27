@@ -29,13 +29,14 @@ Then go to **Settings → Devices & services → Add integration → HA Chat**.
 | Field | Example | Notes |
 | --- | --- | --- |
 | LLM base URL | `http://192.168.1.10:11434/v1` | OpenAI-compatible base URL (must support `/chat/completions` with tools) |
-| Model name | `qwen3.8 27b` | Whatever your server expects in `model` |
 | LLM API key | *(optional)* | Sent as `Authorization: Bearer …` if set |
 | MCP server URL | `http://homeassistant.local:9584/private_xxxx` | ha-mcp connect URL from its *Configure* screen; `ws://` URLs also work |
 | MCP bearer token | *(optional)* | Only if your MCP server requires it |
-| Context window | `32768` | Your model's context length; drives the utilization gauge |
+| Context window | `32768` | Fallback for the utilization gauge when the LLM server doesn't report a context length |
 
 > **Tip:** the ha-mcp integration prints its connect URL in the Home Assistant log and shows it on the integration's Configure page.
+
+The **model** is picked in the panel itself: click the model chip in the chat header to choose from the models your LLM server reports on `/models`. The choice persists per browser.
 
 Settings are stored server-side in the integration, so they apply on every device. Chats and tool auto-approvals persist per browser.
 
@@ -48,7 +49,7 @@ Settings are stored server-side in the integration, so they apply on every devic
   - **Reject** — skip it; the model is told the call was rejected
 - Responses stream in with a live tokens/s readout; the ■ button stops generation mid-response.
 - The ring gauge next to the send button shows context utilization — click it for a token breakdown.
-- The ⚙ settings dialog shows the configured model/endpoints, the tool count, and lets you revoke "always allow" tools.
+- The ⚙ settings dialog shows the active model, the configured endpoints, the tool count, and lets you revoke "always allow" tools.
 
 ## Notes & limitations
 

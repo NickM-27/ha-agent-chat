@@ -8,6 +8,7 @@
 const STORAGE_CHATS = "ha-chat:chats:v1";
 const STORAGE_AUTO_APPROVE = "ha-chat:auto-approve:v1";
 const STORAGE_REASONING = "ha-chat:reasoning:v1";
+const STORAGE_MODEL = "ha-chat:model:v1";
 const MAX_AUTO_TURNS = 15;
 
 const SYSTEM_PROMPT = [
@@ -256,6 +257,8 @@ class HaChatPanel extends HTMLElement {
     this._stopCurrent = null;
     // null = follow the server's default until the user flips the toggle.
     this._reasoningPref = loadJson(STORAGE_REASONING, null);
+    // null = let the server pick (legacy configured model or first available).
+    this._model = loadJson(STORAGE_MODEL, null);
 
     this.chats = loadJson(STORAGE_CHATS, []);
     this.autoApprove = new Set(loadJson(STORAGE_AUTO_APPROVE, []));
@@ -325,12 +328,33 @@ class HaChatPanel extends HTMLElement {
   }
 
   async _loadServerInfo() {
+    await this._loadConfig();
+    await this._loadTools(false);
+    this._render();
+  }
+
+  async _loadConfig() {
+    // The server resolves the model: our pick, else the legacy configured
+    // one, else the first the LLM server reports. It also probes that model
+    // for context window and reasoning support.
+    const request = { type: "ha_chat/config" };
+    if (this._model) request.model = this._model;
     try {
-      this._serverConfig = await this._ws({ type: "ha_chat/config" });
+      this._serverConfig = await this._ws(request);
+      this._model = this._serverConfig.model || this._model;
     } catch (e) {
       this._serverConfig = null;
     }
-    await this._loadTools(false);
+  }
+
+  async _selectModel(model) {
+    this.$("#model-menu").setAttribute("hidden", "");
+    if (model === this._model) return;
+    this._model = model;
+    saveJson(STORAGE_MODEL, model);
+    this._renderHeader();
+    // Re-probe: context window and reasoning support differ per model.
+    await this._loadConfig();
     this._render();
   }
 
@@ -534,6 +558,7 @@ class HaChatPanel extends HTMLElement {
       type: "ha_chat/chat_stream",
       messages: [{ role: "system", content: SYSTEM_PROMPT }, ...chat.messages],
     };
+    if (this._model) request.model = this._model;
     // Only steer reasoning for models that support it; otherwise leave the
     // request untouched.
     if (this._serverConfig?.supports_reasoning) {
@@ -707,6 +732,7 @@ class HaChatPanel extends HTMLElement {
             <div id="header-title">HA Chat</div>
             <div id="header-status"></div>
             <button id="settings-btn" class="icon-btn" title="Settings">⚙</button>
+            <div id="model-menu" hidden></div>
           </div>
           <div id="banner-area"></div>
           <div id="messages"></div>
@@ -756,11 +782,23 @@ class HaChatPanel extends HTMLElement {
       this._renderComposerState();
     });
     this.shadowRoot.addEventListener("click", (ev) => {
-      const popover = this.$("#ctx-popover");
-      if (popover.hasAttribute("hidden")) return;
       const path = ev.composedPath();
-      if (!path.includes(popover) && !path.includes(this.$("#ctx-gauge"))) {
+      const popover = this.$("#ctx-popover");
+      if (
+        !popover.hasAttribute("hidden") &&
+        !path.includes(popover) &&
+        !path.includes(this.$("#ctx-gauge"))
+      ) {
         popover.setAttribute("hidden", "");
+      }
+      const menu = this.$("#model-menu");
+      const chip = this.$("#model-chip");
+      if (
+        !menu.hasAttribute("hidden") &&
+        !path.includes(menu) &&
+        (!chip || !path.includes(chip))
+      ) {
+        menu.setAttribute("hidden", "");
       }
     });
 
@@ -814,13 +852,20 @@ class HaChatPanel extends HTMLElement {
   _renderHeader() {
     const status = this.$("#header-status");
     status.textContent = "";
-    const model = this._serverConfig?.model;
-    if (model) {
-      const chip = document.createElement("span");
-      chip.className = "chip";
-      chip.textContent = model;
-      status.appendChild(chip);
-    }
+    const chip = document.createElement("button");
+    chip.className = "chip chip-btn";
+    chip.id = "model-chip";
+    chip.title = "Switch model";
+    const label = document.createElement("span");
+    label.className = "chip-label";
+    label.textContent =
+      this._model || (this._serverConfig ? "no model" : "…");
+    const caret = document.createElement("span");
+    caret.className = "chip-caret";
+    caret.textContent = "▾";
+    chip.append(label, caret);
+    chip.addEventListener("click", () => this._toggleModelMenu());
+    status.appendChild(chip);
     const toolsChip = document.createElement("span");
     toolsChip.className = "chip";
     if (this._tools) {
@@ -833,6 +878,44 @@ class HaChatPanel extends HTMLElement {
       toolsChip.textContent = "…";
     }
     status.appendChild(toolsChip);
+  }
+
+  async _toggleModelMenu() {
+    const menu = this.$("#model-menu");
+    if (!menu.hasAttribute("hidden")) {
+      menu.setAttribute("hidden", "");
+      return;
+    }
+    this._renderModelMenu();
+    menu.removeAttribute("hidden");
+    // Refresh in the background; servers like llama-swap and LM Studio
+    // change their model list at runtime.
+    await this._loadConfig();
+    this._renderHeader();
+    if (!menu.hasAttribute("hidden")) this._renderModelMenu();
+  }
+
+  _renderModelMenu() {
+    const menu = this.$("#model-menu");
+    menu.textContent = "";
+    const models = this._serverConfig?.models || [];
+    if (!models.length) {
+      const empty = document.createElement("div");
+      empty.className = "muted small pad";
+      empty.textContent = this._serverConfig
+        ? "No models reported by the LLM server"
+        : "LLM server unreachable";
+      menu.appendChild(empty);
+      return;
+    }
+    for (const model of models) {
+      const item = document.createElement("button");
+      item.className = "model-item" + (model === this._model ? " active" : "");
+      item.textContent = model;
+      item.title = model;
+      item.addEventListener("click", () => this._selectModel(model));
+      menu.appendChild(item);
+    }
   }
 
   _renderChatList() {
@@ -1248,14 +1331,15 @@ class HaChatPanel extends HTMLElement {
     const conf = this._serverConfig;
     info.innerHTML = `
       <h3>Connection</h3>
-      <div class="kv"><span>Model</span><span>${escapeHtml(conf?.model || "?")}</span></div>
+      <div class="kv"><span>Model</span><span>${escapeHtml(this._model || "?")}</span></div>
       <div class="kv"><span>LLM</span><span>${escapeHtml(conf?.llm_url || "?")}</span></div>
       <div class="kv"><span>MCP</span><span>${escapeHtml(conf?.mcp_url || "?")}</span></div>
       <div class="kv"><span>Context window</span><span>${(conf?.context_window || 32768).toLocaleString()} tokens</span></div>
       <div class="kv"><span>Tools</span><span>${
         this._tools ? this._tools.length : escapeHtml(this._toolsError || "…")
       }</span></div>
-      <p class="muted small">Endpoints are configured on the HA Chat integration
+      <p class="muted small">The model is switched from the chip in the header.
+      Endpoints are configured on the HA Chat integration
       (Settings → Devices &amp; services → HA Chat → Configure).</p>`;
     const refresh = document.createElement("button");
     refresh.className = "secondary";
@@ -1419,6 +1503,7 @@ const STYLES = `
     background: var(--primary-color, #03a9f4);
   }
   #header {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -1441,6 +1526,54 @@ const STYLES = `
     text-overflow: ellipsis;
   }
   .chip-error { background: var(--error-color, #db4437); color: #fff; }
+  button.chip-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    border: 1px solid transparent;
+    cursor: pointer;
+  }
+  button.chip-btn:hover {
+    border-color: var(--primary-color, #03a9f4);
+    color: var(--primary-text-color, #212121);
+  }
+  .chip-label { overflow: hidden; text-overflow: ellipsis; }
+  .chip-caret { flex: none; font-size: 9px; }
+
+  #model-menu[hidden] { display: none; }
+  #model-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 12px;
+    z-index: 6;
+    min-width: 200px;
+    max-width: min(340px, calc(100vw - 24px));
+    max-height: 50vh;
+    overflow-y: auto;
+    background: var(--card-background-color, #fff);
+    border: 1px solid var(--divider-color, #e0e0e0);
+    border-radius: 10px;
+    box-shadow: 0 6px 24px rgba(0,0,0,0.18);
+    padding: 4px;
+  }
+  .model-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    color: var(--primary-text-color, #212121);
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 13px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .model-item:hover { background: var(--secondary-background-color, #f5f5f5); }
+  .model-item.active {
+    color: var(--primary-color, #03a9f4);
+    font-weight: 600;
+  }
 
   #banner-area { flex: none; }
   .banner {

@@ -17,7 +17,6 @@ from homeassistant.core import callback
 from .const import (
     CONF_CONTEXT_WINDOW,
     CONF_LLM_API_KEY,
-    CONF_LLM_MODEL,
     CONF_LLM_URL,
     CONF_MCP_TOKEN,
     CONF_MCP_URL,
@@ -32,9 +31,6 @@ def _schema(defaults: dict[str, Any]) -> vol.Schema:
         {
             vol.Required(
                 CONF_LLM_URL, default=defaults.get(CONF_LLM_URL, DEFAULT_LLM_URL)
-            ): str,
-            vol.Required(
-                CONF_LLM_MODEL, default=defaults.get(CONF_LLM_MODEL, "")
             ): str,
             vol.Optional(
                 CONF_LLM_API_KEY,
