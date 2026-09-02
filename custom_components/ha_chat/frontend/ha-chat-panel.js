@@ -241,6 +241,7 @@ class HaChatPanel extends HTMLElement {
     this._sidebarOpen = false;
     this._busy = false;
     this._executing = false;
+    this._editingIndex = null;
     this._autoTurns = 0;
     this._pausedChatId = null;
     this._error = null;
@@ -393,6 +394,7 @@ class HaChatPanel extends HTMLElement {
     this._sidebarOpen = false;
     this._error = null;
     this._warning = null;
+    this._editingIndex = null;
     this._render();
     this._focusInput();
   }
@@ -429,6 +431,7 @@ class HaChatPanel extends HTMLElement {
     this._sidebarOpen = false;
     this._error = null;
     this._warning = null;
+    this._editingIndex = null;
     this._render();
     this._focusInput();
   }
@@ -654,6 +657,12 @@ class HaChatPanel extends HTMLElement {
         this._render();
         return;
       }
+      // Measure before the bubble grows: only follow the stream when the
+      // reader is already at the bottom, so scrolling up to reread works.
+      const container = this.$("#messages");
+      const atBottom =
+        container.scrollHeight - container.scrollTop - container.clientHeight <
+        80;
       const bubble = this.shadowRoot.querySelector("#stream-bubble");
       if (bubble) bubble.innerHTML = renderMarkdown(this._streamText);
       const think = this.shadowRoot.querySelector("#stream-think .think-content");
@@ -662,8 +671,7 @@ class HaChatPanel extends HTMLElement {
       if (meta) meta.textContent = this._liveStats();
       this._renderGauge(this._currentChat());
       this._renderCtxPopover();
-      const container = this.$("#messages");
-      container.scrollTop = container.scrollHeight;
+      if (atBottom) container.scrollTop = container.scrollHeight;
     });
   }
 
@@ -754,6 +762,98 @@ class HaChatPanel extends HTMLElement {
     this._autoTurns = 0;
     this._render();
     if (chat) await this._runLLM(chat);
+  }
+
+  /* ---------- message editing ---------- */
+
+  _startEdit(index) {
+    this._editingIndex = index;
+    this._render();
+  }
+
+  _cancelEdit() {
+    this._editingIndex = null;
+    this._render();
+  }
+
+  _saveEdit(chat, index, text, resend) {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    this._editingIndex = null;
+    chat.messages[index].content = trimmed;
+    if (index === 0) {
+      chat.title =
+        trimmed.length > 42 ? `${trimmed.slice(0, 42)}…` : trimmed;
+    }
+    if (resend) {
+      // Regenerate from here: everything after the edited message is stale.
+      chat.messages.splice(index + 1);
+      chat.pending = null;
+      this._autoTurns = 0;
+      this._pausedChatId = null;
+      this._touch(chat);
+      this._save();
+      this._render();
+      this._runLLM(chat);
+      return;
+    }
+    this._touch(chat);
+    this._save();
+    this._render();
+  }
+
+  _deleteUserMessage(chat, index) {
+    if (!confirm("Delete this message and its responses?")) return;
+    // Remove the user message together with the responses it produced
+    // (everything up to the next user message).
+    let end = index + 1;
+    while (end < chat.messages.length && chat.messages[end].role !== "user") {
+      end += 1;
+    }
+    const removedTail = end >= chat.messages.length;
+    chat.messages.splice(index, end - index);
+    if (removedTail) chat.pending = null;
+    this._editingIndex = null;
+    if (!chat.messages.length) {
+      // Nothing left; drop the chat like the lazy-create flow expects.
+      this.chats = this.chats.filter((c) => c.id !== chat.id);
+      this.currentId = this.chats.length ? this.chats[0].id : null;
+    } else {
+      this._touch(chat);
+    }
+    this._save();
+    this._render();
+  }
+
+  async _copyMessage(text, btn) {
+    let ok = false;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        ok = true;
+      }
+    } catch (e) {
+      /* fall through to the legacy path */
+    }
+    if (!ok) {
+      // HA served over plain http has no async clipboard API.
+      const helper = document.createElement("textarea");
+      helper.value = text;
+      helper.style.cssText = "position:fixed;top:0;left:0;opacity:0;";
+      this.shadowRoot.appendChild(helper);
+      helper.focus();
+      helper.select();
+      try {
+        ok = document.execCommand("copy");
+      } catch (e) {
+        ok = false;
+      }
+      helper.remove();
+    }
+    const icon = btn?.querySelector("ha-icon");
+    if (!icon) return;
+    icon.setAttribute("icon", ok ? "mdi:check" : "mdi:alert-circle-outline");
+    setTimeout(() => icon.setAttribute("icon", "mdi:content-copy"), 1200);
   }
 
   /* ---------- UI skeleton ---------- */
@@ -1046,6 +1146,7 @@ class HaChatPanel extends HTMLElement {
 
   _renderMessages() {
     const container = this.$("#messages");
+    const prevScroll = container.scrollTop;
     const atBottom =
       container.scrollHeight - container.scrollTop - container.clientHeight < 80;
     container.textContent = "";
@@ -1069,15 +1170,33 @@ class HaChatPanel extends HTMLElement {
       if (message.role === "tool") toolResults.set(message.tool_call_id, message);
     }
 
-    for (const message of chat?.messages || []) {
+    const messages = chat?.messages || [];
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i];
       if (message.role === "system" || message.role === "tool") continue;
 
       if (message.role === "user") {
+        if (this._editingIndex === i) {
+          container.appendChild(this._editRow(chat, i, message));
+          continue;
+        }
         const row = document.createElement("div");
         row.className = "msg-row user";
         const bubble = document.createElement("div");
         bubble.className = "bubble user";
         bubble.textContent = contentToText(message.content);
+        if (!this._busy && !this._executing) {
+          row.appendChild(
+            this._msgActions([
+              ["mdi:pencil-outline", "Edit message", () => this._startEdit(i)],
+              [
+                "mdi:delete-outline",
+                "Delete message and its responses",
+                () => this._deleteUserMessage(chat, i),
+              ],
+            ])
+          );
+        }
         row.appendChild(bubble);
         container.appendChild(row);
         continue;
@@ -1088,13 +1207,23 @@ class HaChatPanel extends HTMLElement {
         container.appendChild(this._thinkBlock(message._ui.think, false));
       }
       const text = contentToText(message.content);
-      if (text && text.replace(/<think>[\s\S]*?<\/think>/g, "").trim()) {
+      const clean = text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+      if (clean) {
         const row = document.createElement("div");
         row.className = "msg-row assistant";
         const bubble = document.createElement("div");
         bubble.className = "bubble assistant";
         bubble.innerHTML = renderMarkdown(text);
         row.appendChild(bubble);
+        row.appendChild(
+          this._msgActions([
+            [
+              "mdi:content-copy",
+              "Copy message",
+              (ev) => this._copyMessage(clean, ev.currentTarget),
+            ],
+          ])
+        );
         container.appendChild(row);
       }
       for (const tc of message.tool_calls || []) {
@@ -1156,7 +1285,66 @@ class HaChatPanel extends HTMLElement {
       }
     }
 
+    // Rebuilding the list resets the scroll position; put it back so a
+    // reader scrolled up isn't yanked around by mid-generation renders.
     if (atBottom) container.scrollTop = container.scrollHeight;
+    else container.scrollTop = prevScroll;
+  }
+
+  _msgActions(actions) {
+    const wrap = document.createElement("div");
+    wrap.className = "msg-actions";
+    for (const [icon, title, onClick] of actions) {
+      const btn = document.createElement("button");
+      btn.className = "icon-btn msg-action";
+      btn.title = title;
+      btn.innerHTML = `<ha-icon icon="${icon}"></ha-icon>`;
+      btn.addEventListener("click", onClick);
+      wrap.appendChild(btn);
+    }
+    return wrap;
+  }
+
+  _editRow(chat, index, message) {
+    const row = document.createElement("div");
+    row.className = "msg-row user";
+    const box = document.createElement("div");
+    box.className = "edit-box";
+    const textarea = document.createElement("textarea");
+    textarea.value = contentToText(message.content);
+    textarea.rows = Math.min(8, Math.max(2, textarea.value.split("\n").length));
+    textarea.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape") this._cancelEdit();
+      if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
+        ev.preventDefault();
+        this._saveEdit(chat, index, textarea.value, true);
+      }
+    });
+    const actions = document.createElement("div");
+    actions.className = "edit-actions";
+    const cancel = document.createElement("button");
+    cancel.className = "secondary";
+    cancel.textContent = "Cancel";
+    cancel.addEventListener("click", () => this._cancelEdit());
+    const save = document.createElement("button");
+    save.className = "secondary";
+    save.textContent = "Save";
+    save.title = "Keep the change without regenerating";
+    save.addEventListener("click", () =>
+      this._saveEdit(chat, index, textarea.value, false)
+    );
+    const resend = document.createElement("button");
+    resend.className = "primary";
+    resend.textContent = "Save & send";
+    resend.title = "Regenerate from here — discards the later messages";
+    resend.addEventListener("click", () =>
+      this._saveEdit(chat, index, textarea.value, true)
+    );
+    actions.append(cancel, save, resend);
+    box.append(textarea, actions);
+    row.appendChild(box);
+    setTimeout(() => textarea.focus(), 0);
+    return row;
   }
 
   _toolHistoryCard(toolCall, resultMessage) {
@@ -1763,8 +1951,43 @@ const STYLES = `
     margin: 0 auto;
   }
   .welcome { margin: auto; text-align: center; max-width: 420px; color: var(--secondary-text-color, #727272); }
-  .msg-row { display: flex; }
+  .msg-row { display: flex; gap: 2px; }
   .msg-row.user { justify-content: flex-end; }
+  .msg-actions {
+    display: flex;
+    align-items: flex-end;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+  }
+  .msg-row:hover .msg-actions, .msg-actions:focus-within { opacity: 1; }
+  @media (hover: none) { .msg-actions { opacity: 0.55; } }
+  .msg-action { padding: 4px 5px; line-height: 0; }
+  .msg-action ha-icon { --mdc-icon-size: 16px; }
+  .msg-action:hover { color: var(--primary-color, #03a9f4); }
+  .edit-box {
+    width: 78%;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .edit-box textarea {
+    width: 100%;
+    resize: vertical;
+    border: 1px solid var(--primary-color, #03a9f4);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font: inherit;
+    background: var(--primary-background-color, #fafafa);
+    color: inherit;
+    outline: none;
+  }
+  .edit-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+  }
+  .edit-actions button { padding: 6px 12px; font-size: 13px; }
   .bubble {
     max-width: 78%;
     padding: 10px 14px;
@@ -2011,6 +2234,7 @@ const STYLES = `
   }
   #layout.narrow #menu-btn { display: block; }
   #layout.narrow .bubble, #layout.narrow .tool-card { max-width: 92%; }
+  #layout.narrow .edit-box { width: 92%; }
 
   /* settings dialog */
   #settings-overlay[hidden] { display: none; }
