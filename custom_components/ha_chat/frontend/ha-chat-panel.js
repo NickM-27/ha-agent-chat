@@ -1184,7 +1184,7 @@ class HaChatPanel extends HTMLElement {
         row.className = "msg-row user";
         const bubble = document.createElement("div");
         bubble.className = "bubble user";
-        bubble.textContent = contentToText(message.content);
+        bubble.innerHTML = renderMarkdown(message.content);
         if (!this._busy && !this._executing) {
           row.appendChild(
             this._msgActions([
@@ -1994,7 +1994,7 @@ const STYLES = `
     border-radius: 14px;
     line-height: 1.45;
     font-size: 14px;
-    white-space: pre-wrap;
+    white-space: normal;
     overflow-wrap: break-word;
   }
   .bubble.user {
@@ -2006,32 +2006,31 @@ const STYLES = `
     background: var(--card-background-color, #fff);
     border: 1px solid var(--divider-color, #e0e0e0);
     border-bottom-left-radius: 4px;
-    white-space: normal;
   }
-  .bubble.assistant p { margin: 6px 0; }
-  .bubble.assistant p:first-child, .bubble.assistant > :first-child { margin-top: 0; }
-  .bubble.assistant p:last-child, .bubble.assistant > :last-child { margin-bottom: 0; }
-  .bubble.assistant h3, .bubble.assistant h4, .bubble.assistant h5, .bubble.assistant h6 {
+  .bubble p { margin: 6px 0; }
+  .bubble p:first-child, .bubble > :first-child { margin-top: 0; }
+  .bubble p:last-child, .bubble > :last-child { margin-bottom: 0; }
+  .bubble h3, .bubble h4, .bubble h5, .bubble h6 {
     margin: 12px 0 6px;
     line-height: 1.3;
   }
-  .bubble.assistant h3 { font-size: 17px; }
-  .bubble.assistant h4 { font-size: 15px; }
-  .bubble.assistant h5, .bubble.assistant h6 { font-size: 14px; }
-  .bubble.assistant ul, .bubble.assistant ol { margin: 6px 0; padding-left: 22px; }
-  .bubble.assistant li { margin: 2px 0; }
-  .bubble.assistant blockquote {
+  .bubble h3 { font-size: 17px; }
+  .bubble h4 { font-size: 15px; }
+  .bubble h5, .bubble h6 { font-size: 14px; }
+  .bubble ul, .bubble ol { margin: 6px 0; padding-left: 22px; }
+  .bubble li { margin: 2px 0; }
+  .bubble blockquote {
     margin: 6px 0;
     padding: 4px 12px;
     border-left: 3px solid var(--primary-color, #03a9f4);
     color: var(--secondary-text-color, #727272);
   }
-  .bubble.assistant hr {
+  .bubble hr {
     border: none;
     border-top: 1px solid var(--divider-color, #e0e0e0);
     margin: 10px 0;
   }
-  .bubble.assistant table {
+  .bubble table {
     border-collapse: collapse;
     margin: 8px 0;
     display: block;
@@ -2039,13 +2038,13 @@ const STYLES = `
     overflow-x: auto;
     font-size: 13px;
   }
-  .bubble.assistant th, .bubble.assistant td {
+  .bubble th, .bubble td {
     border: 1px solid var(--divider-color, #e0e0e0);
     padding: 4px 10px;
     text-align: left;
   }
-  .bubble.assistant th { background: var(--secondary-background-color, #f5f5f5); }
-  .bubble.assistant pre {
+  .bubble th { background: var(--secondary-background-color, #f5f5f5); }
+  .bubble pre {
     background: var(--secondary-background-color, #f5f5f5);
     padding: 10px;
     border-radius: 8px;
@@ -2053,13 +2052,27 @@ const STYLES = `
     margin: 8px 0;
     white-space: pre;
   }
-  .bubble.assistant code {
+  .bubble code {
     background: var(--secondary-background-color, #f5f5f5);
     padding: 1px 4px;
     border-radius: 4px;
   }
-  .bubble.assistant pre code { background: none; padding: 0; }
-  .bubble.assistant a { color: var(--primary-color, #03a9f4); }
+  .bubble pre code { background: none; padding: 0; }
+  .bubble a { color: var(--primary-color, #03a9f4); }
+  /* markdown on the colored user bubble needs its own contrast */
+  .bubble.user pre, .bubble.user code {
+    background: rgba(0, 0, 0, 0.18);
+    color: inherit;
+  }
+  .bubble.user pre code { background: none; }
+  .bubble.user a { color: inherit; text-decoration: underline; }
+  .bubble.user blockquote {
+    border-left-color: rgba(255, 255, 255, 0.7);
+    color: inherit;
+  }
+  .bubble.user th { background: rgba(0, 0, 0, 0.18); }
+  .bubble.user th, .bubble.user td { border-color: rgba(255, 255, 255, 0.4); }
+  .bubble.user hr { border-top-color: rgba(255, 255, 255, 0.4); }
   .bubble.assistant.streaming::after {
     content: "▍";
     animation: cursor-blink 1s steps(1) infinite;
