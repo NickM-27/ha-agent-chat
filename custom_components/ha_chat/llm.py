@@ -157,6 +157,10 @@ async def async_stream_chat_completion(
         # Ask for token usage in the final chunk (OpenAI, LM Studio,
         # Ollama, vLLM and llama.cpp all support this).
         "stream_options": {"include_usage": True},
+        # llama.cpp: attach prompt/KV-cache/speed timings to each chunk so the
+        # panel can show live context stats. Other servers ignore it or reject
+        # it with a 400, which the retry below handles.
+        "timings_per_token": True,
     }
     if tools:
         payload["tools"] = tools
@@ -171,7 +175,12 @@ async def async_stream_chat_completion(
 
     # Nonstandard fields some servers reject with a 400; drop the ones the
     # error message names and retry.
-    optional_fields = ["stream_options", "chat_template_kwargs", "reasoning_effort"]
+    optional_fields = [
+        "stream_options",
+        "chat_template_kwargs",
+        "reasoning_effort",
+        "timings_per_token",
+    ]
     resp: aiohttp.ClientResponse | None = None
     for _ in range(len(optional_fields) + 1):
         try:

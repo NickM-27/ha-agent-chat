@@ -253,6 +253,9 @@ class HaChatPanel extends HTMLElement {
     this._streamRaf = null;
     this._streamStart = null;
     this._streamChunks = 0;
+    this._streamTimings = null;
+    this._streamChatId = null;
+    this._ctxDetailsOpen = true;
     this._unsubStream = null;
     this._stopCurrent = null;
     // null = follow the server's default until the user flips the toggle.
@@ -458,6 +461,8 @@ class HaChatPanel extends HTMLElement {
     this._streamThink = "";
     this._streamStart = null;
     this._streamChunks = 0;
+    this._streamTimings = null;
+    this._streamChatId = chat.id;
     this._render();
 
     let unsub = null;
@@ -488,7 +493,26 @@ class HaChatPanel extends HTMLElement {
       }
       if (meta) message._ui = meta;
       chat.messages.push(message);
-      if (meta?.usage) chat.usage = meta.usage;
+      if (meta?.usage || meta?.timings) {
+        chat.usage = meta.usage || chat.usage;
+        chat.timings = meta.timings || null;
+        if (meta.rate) chat.rate = meta.rate;
+        // Running totals across turns; "evaluated" counts only freshly
+        // processed prompt tokens when the server reports cache hits.
+        const totals = (chat.totals = chat.totals || {
+          evaluated: 0,
+          generated: 0,
+        });
+        const cached =
+          meta.timings?.cache_n ??
+          meta.usage?.prompt_tokens_details?.cached_tokens ??
+          0;
+        totals.evaluated +=
+          meta.timings?.prompt_n ??
+          Math.max(0, (meta.usage?.prompt_tokens || 0) - cached);
+        totals.generated +=
+          meta.usage?.completion_tokens ?? meta.timings?.predicted_n ?? 0;
+      }
       this._touch(chat);
 
       const toolCalls = message.tool_calls || [];
@@ -525,6 +549,13 @@ class HaChatPanel extends HTMLElement {
         this._streamChunks += 1;
         this._streamThink += ev.content;
         this._renderStream();
+      } else if (ev.type === "stats") {
+        // Live prompt/cache/speed timings from the server (llama.cpp).
+        this._streamTimings = ev.timings || null;
+        this._renderGauge(this._currentChat());
+        this._renderCtxPopover();
+        const meta = this.shadowRoot.querySelector("#stream-meta");
+        if (meta) meta.textContent = this._liveStats();
       } else if (ev.type === "done") {
         this._warning = ev.warning || null;
         finalize(ev.message, {
@@ -533,6 +564,7 @@ class HaChatPanel extends HTMLElement {
           estimated: ev.estimated,
           elapsed: ev.elapsed,
           usage: ev.usage || null,
+          timings: ev.timings || null,
           think: ev.reasoning || null,
         });
       } else if (ev.type === "error") {
@@ -581,6 +613,15 @@ class HaChatPanel extends HTMLElement {
   }
 
   _liveStats() {
+    // Prefer the server's own timings when it reports them.
+    const timings = this._streamTimings;
+    if (timings?.predicted_n) {
+      const rate = timings.predicted_per_second;
+      const bits = [];
+      if (rate) bits.push(`${Number(rate).toFixed(1)} tok/s`);
+      bits.push(`${timings.predicted_n} tokens`);
+      return bits.join(" · ");
+    }
     // Delta chunks roughly equal tokens; wait for a few before showing a rate.
     if (!this._streamStart || this._streamChunks < 5) return "";
     const seconds = (performance.now() - this._streamStart) / 1000;
@@ -619,6 +660,8 @@ class HaChatPanel extends HTMLElement {
       if (think) think.textContent = this._streamThink;
       const meta = this.shadowRoot.querySelector("#stream-meta");
       if (meta) meta.textContent = this._liveStats();
+      this._renderGauge(this._currentChat());
+      this._renderCtxPopover();
       const container = this.$("#messages");
       container.scrollTop = container.scrollHeight;
     });
@@ -1241,6 +1284,7 @@ class HaChatPanel extends HTMLElement {
         ? "Generating…"
         : "Message…";
     this._renderGauge(chat);
+    this._renderCtxPopover();
   }
 
   _contextStats(chat) {
@@ -1259,6 +1303,19 @@ class HaChatPanel extends HTMLElement {
       estimated = true;
       const text = chat ? JSON.stringify(chat.messages) : "";
       used = Math.round((text.length + SYSTEM_PROMPT.length) / 4);
+    }
+    // Fold in the in-flight request so the gauge and popover tick up live
+    // while streaming.
+    if (this._busy && chat && chat.id === this._streamChatId) {
+      const timings = this._streamTimings;
+      if (timings?.prompt_n != null) {
+        used =
+          timings.prompt_n +
+          (timings.cache_n || 0) +
+          (timings.predicted_n ?? this._streamChunks);
+      } else {
+        used += this._streamChunks;
+      }
     }
     const pct = Math.min(100, Math.round((used / limit) * 100));
     return { limit, used, estimated, pct, prompt, completion };
@@ -1291,32 +1348,97 @@ class HaChatPanel extends HTMLElement {
       popover.setAttribute("hidden", "");
       return;
     }
-    const stats = this._contextStats(this._currentChat());
-    const approx = stats.estimated ? "~" : "";
-    const fmt = (n) => (n == null ? "—" : n.toLocaleString());
-    const remaining = Math.max(0, stats.limit - stats.used);
-    popover.innerHTML = `
-      <h3>Context usage</h3>
-      <div class="kv"><span>Prompt tokens</span><span>${approx}${fmt(
-        stats.prompt ?? (stats.estimated ? stats.used : null)
-      )}</span></div>
-      <div class="kv"><span>Last response</span><span>${fmt(stats.completion)}</span></div>
-      <div class="kv"><span>Total used</span><span>${approx}${fmt(stats.used)}</span></div>
-      <div class="kv"><span>Context window</span><span>${fmt(stats.limit)}</span></div>
-      <div class="kv"><span>Remaining</span><span>${approx}${fmt(remaining)}</span></div>
-      <div class="ctx-bar"><div class="ctx-bar-fill" style="width:${stats.pct}%"></div></div>
-      <div class="kv"><span>Utilization</span><span>${stats.pct}%</span></div>
-      ${
-        stats.estimated
-          ? '<p class="muted small">No token counts reported yet — estimated from text length. Updates with real numbers after each response.</p>'
-          : '<p class="muted small">Token counts reported by the LLM server after the last response.</p>'
-      }
-      <p class="muted small">${
-        this._serverConfig?.context_window_source === "detected"
-          ? "Context window detected from the LLM server."
-          : "Context window from the integration settings."
-      }</p>`;
+    this._renderCtxPopover(true);
     popover.removeAttribute("hidden");
+  }
+
+  // llama.cpp-webui-style context popover: a compact used/limit header with a
+  // bar, plus collapsible per-turn token details. Re-rendered live while open.
+  _renderCtxPopover(force = false) {
+    const popover = this.$("#ctx-popover");
+    if (!popover || (!force && popover.hasAttribute("hidden"))) return;
+    const chat = this._currentChat();
+    const stats = this._contextStats(chat);
+    const approx = stats.estimated ? "~" : "";
+    const fmt = (n) => (n == null ? "—" : Math.round(n).toLocaleString());
+    const tok = (n) => (n == null ? "—" : `${fmt(n)} tok`);
+    const fmtK = (n) =>
+      n >= 1000 ? `${(n / 1000).toFixed(2)}K` : `${Math.round(n)}`;
+    const remaining = Math.max(0, stats.limit - stats.used);
+    const barColor =
+      stats.pct >= 90
+        ? "var(--error-color, #db4437)"
+        : stats.pct >= 70
+          ? "var(--warning-color, #ffa600)"
+          : "var(--success-color, #0f9d58)";
+
+    // Per-request details: live server timings while streaming, else the
+    // last completed request.
+    const streaming = this._busy && chat && chat.id === this._streamChatId;
+    const live = streaming ? this._streamTimings : null;
+    const timings = live || chat?.timings || null;
+    const usage = live ? null : chat?.usage || null;
+    const cached =
+      timings?.cache_n ?? usage?.prompt_tokens_details?.cached_tokens ?? null;
+    const fresh =
+      timings?.prompt_n ??
+      (usage?.prompt_tokens != null && cached != null
+        ? usage.prompt_tokens - cached
+        : null);
+    const prompt =
+      usage?.prompt_tokens ?? (fresh != null ? fresh + (cached || 0) : null);
+    const generated = streaming
+      ? live?.predicted_n ?? this._streamChunks
+      : usage?.completion_tokens ?? timings?.predicted_n ?? null;
+    const total =
+      prompt != null && generated != null ? prompt + generated : null;
+    let speed =
+      timings?.predicted_per_second ?? (streaming ? null : chat?.rate);
+    if (streaming && !speed && this._streamStart && this._streamChunks >= 5) {
+      const seconds = (performance.now() - this._streamStart) / 1000;
+      if (seconds > 0.5) speed = this._streamChunks / seconds;
+    }
+    const totals = chat?.totals;
+
+    let details;
+    if (totals || prompt != null || generated != null) {
+      details = `
+        <details class="ctx-details"${this._ctxDetailsOpen ? " open" : ""}>
+          <summary>Token usage details</summary>
+          <div class="ctx-section">Across all turns</div>
+          <div class="kv"><span>Prompt tokens evaluated</span><span>${tok(totals?.evaluated)}</span></div>
+          <div class="kv"><span>Tokens generated</span><span>${tok(totals?.generated)}</span></div>
+          <div class="ctx-section">This turn${cached != null ? " · KV cache" : ""}</div>
+          <div class="kv"><span>Prompt</span><span>${tok(prompt)}</span></div>
+          ${
+            cached != null && fresh != null
+              ? `<div class="kv ctx-sub"><span></span><span>${fmt(fresh)} fresh + ${fmt(cached)} cached</span></div>`
+              : ""
+          }
+          <div class="kv"><span>Generated</span><span>${streaming && !live ? "~" : ""}${tok(generated)}</span></div>
+          <div class="kv ctx-total"><span>${cached != null ? "KV cache total" : "Total"}</span><span>${tok(total)}</span></div>
+          <div class="kv ctx-speed"><span>Avg speed</span><span>${speed ? `${Number(speed).toFixed(1)} t/s` : "—"}</span></div>
+        </details>`;
+    } else {
+      details =
+        '<p class="muted small">No token counts reported yet — estimated from text length. Updates after the first response.</p>';
+    }
+
+    popover.innerHTML = `
+      <div class="ctx-head" title="${
+        this._serverConfig?.context_window_source === "detected"
+          ? "Context window detected from the LLM server"
+          : "Context window from the integration settings"
+      }">Context <span class="muted">·</span> ${approx}${fmtK(stats.used)} / ${fmtK(stats.limit)}</div>
+      <div class="ctx-bar"><div class="ctx-bar-fill" style="width:${stats.pct}%;background:${barColor}"></div></div>
+      <div class="ctx-row"><span>${stats.pct}% used</span><span>${approx}${fmtK(remaining)} remaining</span></div>
+      ${details}`;
+    const box = popover.querySelector(".ctx-details");
+    if (box) {
+      box.addEventListener("toggle", () => {
+        this._ctxDetailsOpen = box.open;
+      });
+    }
   }
 
   /* ---------- settings dialog ---------- */
@@ -1488,19 +1610,60 @@ const STYLES = `
     box-shadow: 0 6px 24px rgba(0,0,0,0.18);
     font-size: 13px;
   }
-  #ctx-popover h3 { margin: 0 0 8px; font-size: 14px; }
   #ctx-popover p { margin: 8px 0 0; }
+  .ctx-head { font-size: 13px; font-weight: 600; }
+  .ctx-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--secondary-text-color, #727272);
+  }
   .ctx-bar {
     height: 6px;
     border-radius: 3px;
     background: var(--secondary-background-color, #f0f0f0);
-    margin: 8px 0 4px;
+    margin: 8px 0 6px;
     overflow: hidden;
   }
   .ctx-bar-fill {
     height: 100%;
     border-radius: 3px;
     background: var(--primary-color, #03a9f4);
+  }
+  .ctx-details {
+    margin-top: 10px;
+    border-top: 1px solid var(--divider-color, #e0e0e0);
+    padding-top: 8px;
+  }
+  .ctx-details summary {
+    cursor: pointer;
+    font-size: 13px;
+    user-select: none;
+  }
+  .ctx-section {
+    margin: 10px 0 2px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--secondary-text-color, #727272);
+  }
+  .ctx-sub { padding-top: 0; margin-top: -3px; }
+  .ctx-sub span:last-child {
+    font-size: 11px;
+    color: var(--secondary-text-color, #727272);
+  }
+  .ctx-total {
+    margin-top: 4px;
+    border-top: 1px dashed var(--divider-color, #e0e0e0);
+    padding-top: 6px;
+    font-weight: 600;
+  }
+  .ctx-total span:first-child { color: var(--primary-text-color, #212121); }
+  .ctx-speed {
+    margin-top: 6px;
+    border-top: 1px solid var(--divider-color, #e0e0e0);
+    padding-top: 6px;
   }
   #header {
     position: relative;

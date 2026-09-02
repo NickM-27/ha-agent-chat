@@ -246,6 +246,8 @@ async def ws_chat_stream(
     """Stream a chat completion as subscription events.
 
     Events: {type: "delta", content} for each token,
+    {type: "stats", timings} at most once a second when the server reports
+    prompt/cache timings (llama.cpp),
     {type: "done", message, usage, token_rate, ...} at the end, or
     {type: "error", error}. Unsubscribing cancels the LLM request.
     """
@@ -282,6 +284,8 @@ async def ws_chat_stream(
         think_parts: list[str] = []
         tool_calls: dict[int, dict[str, Any]] = {}
         usage: dict[str, Any] | None = None
+        timings: dict[str, Any] | None = None
+        last_stats = 0.0
         chunk_count = 0
         try:
             stream = async_stream_chat_completion(
@@ -296,6 +300,12 @@ async def ws_chat_stream(
             async for chunk in stream:
                 if chunk.get("usage"):
                     usage = chunk["usage"]
+                if isinstance(chunk.get("timings"), dict):
+                    timings = chunk["timings"]
+                    now_ts = time.monotonic()
+                    if now_ts - last_stats >= 1.0:
+                        last_stats = now_ts
+                        _send_event({"type": "stats", "timings": timings})
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue
@@ -351,7 +361,10 @@ async def ws_chat_stream(
             ]
         completion_tokens = (usage or {}).get("completion_tokens")
         estimated = completion_tokens is None
-        if estimated:
+        if estimated and timings and isinstance(timings.get("predicted_n"), int):
+            completion_tokens = timings["predicted_n"]
+            estimated = False
+        if completion_tokens is None:
             # No usage from the server; delta chunks roughly equal tokens.
             completion_tokens = chunk_count
         token_rate = (
@@ -359,6 +372,11 @@ async def ws_chat_stream(
             if completion_tokens and generation_time > 0.05
             else None
         )
+        if timings:
+            # The server's own measurement beats our wall-clock estimate.
+            speed = timings.get("predicted_per_second")
+            if isinstance(speed, (int, float)) and speed > 0:
+                token_rate = round(speed, 1)
         payload: dict[str, Any] = {
             "type": "done",
             "message": message,
@@ -368,6 +386,8 @@ async def ws_chat_stream(
             "elapsed": round(now - started, 2),
             "token_rate": token_rate,
         }
+        if timings:
+            payload["timings"] = timings
         if think_parts:
             payload["reasoning"] = "".join(think_parts)
         if warning:
