@@ -670,26 +670,7 @@ class HaChatPanel extends HTMLElement {
       }
       if (meta) message._ui = meta;
       chat.messages.push(message);
-      if (meta?.usage || meta?.timings) {
-        chat.usage = meta.usage || chat.usage;
-        chat.timings = meta.timings || null;
-        if (meta.rate) chat.rate = meta.rate;
-        // Running totals across turns; "evaluated" counts only freshly
-        // processed prompt tokens when the server reports cache hits.
-        const totals = (chat.totals = chat.totals || {
-          evaluated: 0,
-          generated: 0,
-        });
-        const cached =
-          meta.timings?.cache_n ??
-          meta.usage?.prompt_tokens_details?.cached_tokens ??
-          0;
-        totals.evaluated +=
-          meta.timings?.prompt_n ??
-          Math.max(0, (meta.usage?.prompt_tokens || 0) - cached);
-        totals.generated +=
-          meta.usage?.completion_tokens ?? meta.timings?.predicted_n ?? 0;
-      }
+      if (meta?.usage || meta?.timings) this._recordUsage(chat, meta);
       this._touch(chat);
 
       const toolCalls = message.tool_calls || [];
@@ -788,6 +769,65 @@ class HaChatPanel extends HTMLElement {
       this._stopCurrent = null;
       this._render();
     }
+  }
+
+  // Fold one finished turn into the chat's running totals.
+  _recordUsage(chat, meta) {
+    chat.usage = meta.usage || chat.usage;
+    chat.timings = meta.timings || null;
+    if (meta.rate) chat.rate = meta.rate;
+    // "evaluated" counts only freshly processed prompt tokens when the server
+    // reports cache hits.
+    const totals = (chat.totals = chat.totals || { evaluated: 0, generated: 0 });
+    const cached =
+      meta.timings?.cache_n ??
+      meta.usage?.prompt_tokens_details?.cached_tokens ??
+      0;
+    totals.evaluated +=
+      meta.timings?.prompt_n ??
+      Math.max(0, (meta.usage?.prompt_tokens || 0) - cached);
+    const produced =
+      meta.usage?.completion_tokens ?? meta.timings?.predicted_n ?? 0;
+    totals.generated += produced;
+    // Time spent generating, for the conversation-wide average speed.
+    // llama.cpp reports it outright; otherwise back it out of the turn's own
+    // rate. `timedTokens` counts only the turns that contributed a duration,
+    // so the two always describe the same set of turns and a turn the server
+    // said nothing about cannot inflate the average.
+    let turnMs = null;
+    const predictedMs = meta.timings?.predicted_ms;
+    if (typeof predictedMs === "number" && predictedMs > 0) {
+      turnMs = predictedMs;
+    } else if (produced && meta.rate > 0) {
+      turnMs = (produced / meta.rate) * 1000;
+    }
+    if (turnMs) {
+      totals.generationMs = (totals.generationMs || 0) + turnMs;
+      totals.timedTokens = (totals.timedTokens || 0) + produced;
+    }
+  }
+
+  // Average generation speed across the whole conversation: every token
+  // generated over all the time spent generating, so each turn weighs by its
+  // own size. The in-flight turn is folded in, which keeps the figure moving
+  // while a response streams.
+  _avgSpeed(chat, streaming, live) {
+    const totals = chat?.totals;
+    let tokens = totals?.timedTokens || 0;
+    let ms = totals?.generationMs || 0;
+    if (streaming) {
+      if (live?.predicted_ms > 0 && live?.predicted_n) {
+        tokens += live.predicted_n;
+        ms += live.predicted_ms;
+      } else if (this._streamStart !== null && this._streamChunks >= 5) {
+        const elapsed = performance.now() - this._streamStart;
+        if (elapsed > 500) {
+          tokens += this._streamChunks;
+          ms += elapsed;
+        }
+      }
+    }
+    return ms > 0 && tokens ? (tokens / ms) * 1000 : null;
   }
 
   _liveStats() {
@@ -1827,6 +1867,8 @@ class HaChatPanel extends HTMLElement {
       if (seconds > 0.5) speed = this._streamChunks / seconds;
     }
     const totals = chat?.totals;
+    const avgSpeed = this._avgSpeed(chat, streaming, live);
+    const tps = (value) => (value ? `${Number(value).toFixed(1)} t/s` : "—");
 
     let details;
     if (totals || prompt != null || generated != null) {
@@ -1836,6 +1878,7 @@ class HaChatPanel extends HTMLElement {
           <div class="ctx-section">Across all turns</div>
           <div class="kv"><span>Prompt tokens evaluated</span><span>${tok(totals?.evaluated)}</span></div>
           <div class="kv"><span>Tokens generated</span><span>${tok(totals?.generated)}</span></div>
+          <div class="kv ctx-speed"><span>Avg speed</span><span>${tps(avgSpeed)}</span></div>
           <div class="ctx-section">This turn${cached != null ? " · KV cache" : ""}</div>
           <div class="kv"><span>Prompt</span><span>${tok(prompt)}</span></div>
           ${
@@ -1845,7 +1888,7 @@ class HaChatPanel extends HTMLElement {
           }
           <div class="kv"><span>Generated</span><span>${streaming && !live ? "~" : ""}${tok(generated)}</span></div>
           <div class="kv ctx-total"><span>${cached != null ? "KV cache total" : "Total"}</span><span>${tok(total)}</span></div>
-          <div class="kv ctx-speed"><span>Avg speed</span><span>${speed ? `${Number(speed).toFixed(1)} t/s` : "—"}</span></div>
+          <div class="kv ctx-speed"><span>Speed</span><span>${tps(speed)}</span></div>
         </details>`;
     } else {
       details =
