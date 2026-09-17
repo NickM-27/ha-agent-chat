@@ -9,7 +9,12 @@ const STORAGE_CHATS = "ha-chat:chats:v1";
 const STORAGE_AUTO_APPROVE = "ha-chat:auto-approve:v1";
 const STORAGE_REASONING = "ha-chat:reasoning:v1";
 const STORAGE_MODEL = "ha-chat:model:v1";
+const STORAGE_AUTO_COMPACT = "ha-chat:auto-compact:v1";
 const MAX_AUTO_TURNS = 15;
+
+// Context utilization that triggers automatic compaction, checked once a
+// turn has fully settled.
+const COMPACT_AT = 0.85;
 
 const SYSTEM_PROMPT = [
   "You are HA Chat, an assistant embedded in Home Assistant.",
@@ -18,6 +23,18 @@ const SYSTEM_PROMPT = [
   "Every tool call is shown to the user for approval before it runs, so do not ask for permission in text - just make the call.",
   "Be concise. Use markdown code blocks for YAML or JSON.",
 ].join(" ");
+
+// Asked as a final user turn when compacting. The reply becomes the summary.
+const COMPACT_PROMPT = [
+  "Summarize this conversation so it can stand in for the full history.",
+  "Cover what the user asked for, what you found out about their Home Assistant setup, what you created or changed, and anything still unfinished.",
+  "Keep concrete identifiers verbatim - entity IDs, device and area names, automation and script IDs. Those are what cannot be recovered once the history is gone.",
+  "Write it as notes to yourself, not as a reply to the user: no preamble, no sign-off, no offer to help further.",
+].join(" ");
+
+// Prefixes the summary inside the system message on later turns.
+const COMPACT_PREAMBLE =
+  "The earlier part of this conversation has been compacted. This is a summary of it - continue as if you remember all of it:";
 
 const uid = () =>
   crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
@@ -259,6 +276,10 @@ class HaChatPanel extends HTMLElement {
     this._ctxDetailsOpen = true;
     this._unsubStream = null;
     this._stopCurrent = null;
+    this._compacting = false;
+    this._compactText = "";
+    this._compactRaf = null;
+    this._autoCompact = loadJson(STORAGE_AUTO_COMPACT, true);
     // null = follow the server's default until the user flips the toggle.
     this._reasoningPref = loadJson(STORAGE_REASONING, null);
     // null = let the server pick (legacy configured model or first available).
@@ -441,6 +462,159 @@ class HaChatPanel extends HTMLElement {
     this.chats.sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
+  /* ---------- compaction ---------- */
+
+  // Index of the newest compaction marker, or -1. Markers are always appended
+  // at the tail, so everything before one is folded and nothing after it can
+  // be an orphaned tool result.
+  _compactIndex(chat) {
+    const messages = chat?.messages || [];
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i]._ui?.compaction) return i;
+    }
+    return -1;
+  }
+
+  // What actually goes to the model. The summary rides inside the single
+  // system message rather than as a second one, which every chat template
+  // handles; then only the turns since the fold.
+  _requestMessages(chat) {
+    const messages = chat?.messages || [];
+    const index = this._compactIndex(chat);
+    if (index < 0) {
+      return [{ role: "system", content: SYSTEM_PROMPT }, ...messages];
+    }
+    const summary = contentToText(messages[index].content);
+    return [
+      {
+        role: "system",
+        content: `${SYSTEM_PROMPT}\n\n${COMPACT_PREAMBLE}\n\n${summary}`,
+      },
+      ...messages.slice(index + 1),
+    ];
+  }
+
+  _canCompact(chat) {
+    if (!chat || this._busy || this._executing || this._compacting) return false;
+    if (chat.pending) return false;
+    // Nothing has been said since the last fold.
+    return this._compactIndex(chat) < chat.messages.length - 1;
+  }
+
+  // Fold the history once the context is nearly full. Only at rest: partway
+  // through a tool loop the conversation isn't a summarizable unit.
+  _maybeCompact(chat) {
+    if (!this._autoCompact || !this._canCompact(chat)) return;
+    if (this._contextStats(chat).pct < COMPACT_AT * 100) return;
+    this._compact(chat, { auto: true });
+  }
+
+  async _compact(chat, { auto = false } = {}) {
+    if (!this._canCompact(chat)) return;
+    this._compacting = true;
+    this._compactText = "";
+    this._error = null;
+    this._render();
+
+    const folded = chat.messages.length;
+    let unsub = null;
+    let finished = false;
+
+    const finish = (summary, error) => {
+      if (finished) return;
+      finished = true;
+      this._compacting = false;
+      this._compactText = "";
+      try {
+        unsub?.();
+      } catch (e) {
+        /* connection may be gone */
+      }
+      this._stopCurrent = null;
+      // Abort, error or an empty summary rolls back to exactly where we
+      // were: the marker is the only thing this writes, and it isn't written.
+      if (!summary || !summary.trim()) {
+        if (error) this._error = error;
+        this._render();
+        return;
+      }
+      chat.messages.push({
+        role: "system",
+        content: summary.trim(),
+        _ui: { compaction: true, folded, at: Date.now(), auto },
+      });
+      // Counts from before the fold describe a prompt we no longer send, so
+      // the gauge falls back to estimating the compacted context right away.
+      chat.usage = null;
+      chat.timings = null;
+      this._touch(chat);
+      this._save();
+      this._render();
+    };
+
+    const onEvent = (ev) => {
+      if (ev.type === "delta") {
+        this._compactText += ev.content;
+        this._renderCompactStream();
+      } else if (ev.type === "done") {
+        finish(contentToText(ev.message?.content));
+      } else if (ev.type === "error") {
+        finish(null, ev.error || "Compaction failed");
+      }
+    };
+
+    this._stopCurrent = () => finish(null);
+
+    const request = {
+      type: "ha_chat/chat_stream",
+      messages: [
+        ...this._requestMessages(chat),
+        { role: "user", content: COMPACT_PROMPT },
+      ],
+      with_tools: false,
+    };
+    if (this._model) request.model = this._model;
+    // A summary is not worth a reasoning pass.
+    if (this._serverConfig?.supports_reasoning) request.reasoning = false;
+
+    try {
+      unsub = await this._hass.connection.subscribeMessage(onEvent, request, {
+        resubscribe: false,
+      });
+      // Stopped before the subscription resolved.
+      if (finished) {
+        try {
+          unsub();
+        } catch (e) {
+          /* connection may be gone */
+        }
+      }
+    } catch (e) {
+      finish(null, e?.message || "Compaction failed");
+    }
+  }
+
+  _renderCompactStream() {
+    if (this._compactRaf) return;
+    this._compactRaf = requestAnimationFrame(() => {
+      this._compactRaf = null;
+      const body = this.shadowRoot.querySelector(
+        "#compact-stream .compact-body"
+      );
+      if (!body) {
+        this._render();
+        return;
+      }
+      const container = this.$("#messages");
+      const atBottom =
+        container.scrollHeight - container.scrollTop - container.clientHeight <
+        80;
+      body.textContent = this._compactText;
+      this._renderGauge(this._currentChat());
+      if (atBottom) container.scrollTop = container.scrollHeight;
+    });
+  }
+
   /* ---------- conversation loop ---------- */
 
   async _sendUserMessage(text) {
@@ -538,6 +712,7 @@ class HaChatPanel extends HTMLElement {
         chat.pending = null;
         this._save();
         this._render();
+        this._maybeCompact(chat);
       }
     };
 
@@ -591,7 +766,7 @@ class HaChatPanel extends HTMLElement {
 
     const request = {
       type: "ha_chat/chat_stream",
-      messages: [{ role: "system", content: SYSTEM_PROMPT }, ...chat.messages],
+      messages: this._requestMessages(chat),
     };
     if (this._model) request.model = this._model;
     // Only steer reasoning for models that support it; otherwise leave the
@@ -701,7 +876,9 @@ class HaChatPanel extends HTMLElement {
   }
 
   async _maybeExecute(chat) {
-    if (!chat.pending || this._executing || this._busy) return;
+    if (!chat.pending || this._executing || this._busy || this._compacting) {
+      return;
+    }
     const calls = chat.pending.calls;
     if (calls.some((c) => c.status === "pending")) return;
 
@@ -805,9 +982,14 @@ class HaChatPanel extends HTMLElement {
   _deleteUserMessage(chat, index) {
     if (!confirm("Delete this message and its responses?")) return;
     // Remove the user message together with the responses it produced
-    // (everything up to the next user message).
+    // (everything up to the next user message). A compaction marker also ends
+    // the run: it summarizes more than this turn, so it outlives it.
     let end = index + 1;
-    while (end < chat.messages.length && chat.messages[end].role !== "user") {
+    while (
+      end < chat.messages.length &&
+      chat.messages[end].role !== "user" &&
+      !chat.messages[end]._ui?.compaction
+    ) {
       end += 1;
     }
     const removedTail = end >= chat.messages.length;
@@ -960,7 +1142,7 @@ class HaChatPanel extends HTMLElement {
   }
 
   _handleSend() {
-    if (this._busy) {
+    if (this._busy || this._compacting) {
       this._stopCurrent?.();
       return;
     }
@@ -1171,8 +1353,16 @@ class HaChatPanel extends HTMLElement {
     }
 
     const messages = chat?.messages || [];
+    // Everything before the newest marker is still shown, but it no longer
+    // reaches the model; dim it so the boundary is visible.
+    const compactAt = this._compactIndex(chat);
     for (let i = 0; i < messages.length; i++) {
       const message = messages[i];
+      const folded = compactAt >= 0 && i < compactAt ? " folded" : "";
+      if (message._ui?.compaction) {
+        container.appendChild(this._compactCard(message, i === compactAt));
+        continue;
+      }
       if (message.role === "system" || message.role === "tool") continue;
 
       if (message.role === "user") {
@@ -1181,11 +1371,11 @@ class HaChatPanel extends HTMLElement {
           continue;
         }
         const row = document.createElement("div");
-        row.className = "msg-row user";
+        row.className = `msg-row user${folded}`;
         const bubble = document.createElement("div");
         bubble.className = "bubble user";
         bubble.innerHTML = renderMarkdown(message.content);
-        if (!this._busy && !this._executing) {
+        if (!this._busy && !this._executing && !this._compacting) {
           row.appendChild(
             this._msgActions([
               ["mdi:pencil-outline", "Edit message", () => this._startEdit(i)],
@@ -1210,7 +1400,7 @@ class HaChatPanel extends HTMLElement {
       const clean = text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
       if (clean) {
         const row = document.createElement("div");
-        row.className = "msg-row assistant";
+        row.className = `msg-row assistant${folded}`;
         const bubble = document.createElement("div");
         bubble.className = "bubble assistant";
         bubble.innerHTML = renderMarkdown(text);
@@ -1229,7 +1419,9 @@ class HaChatPanel extends HTMLElement {
       for (const tc of message.tool_calls || []) {
         const isPending = chat.pending?.calls.some((c) => c.id === tc.id);
         if (isPending) continue; // rendered as an approval card below
-        container.appendChild(this._toolHistoryCard(tc, toolResults.get(tc.id)));
+        const card = this._toolHistoryCard(tc, toolResults.get(tc.id));
+        card.className += folded;
+        container.appendChild(card);
       }
       if (
         message._ui &&
@@ -1255,6 +1447,10 @@ class HaChatPanel extends HTMLElement {
         btn.addEventListener("click", () => this._maybeExecute(chat));
         container.appendChild(btn);
       }
+    }
+
+    if (this._compacting) {
+      container.appendChild(this._compactCard(null, true));
     }
 
     if (this._busy) {
@@ -1289,6 +1485,41 @@ class HaChatPanel extends HTMLElement {
     // reader scrolled up isn't yanked around by mid-generation renders.
     if (atBottom) container.scrollTop = container.scrollHeight;
     else container.scrollTop = prevScroll;
+  }
+
+  // The fold marker in the transcript. `message` is null while the summary
+  // is still streaming in. Superseded markers (an older fold, now inside a
+  // newer one) render dimmed.
+  _compactCard(message, active) {
+    const streaming = !message;
+    const meta = message?._ui || {};
+    const card = document.createElement("details");
+    card.className = `compact-card${active ? "" : " superseded"}`;
+    if (streaming) {
+      card.id = "compact-stream";
+      card.open = true;
+    }
+    const summary = document.createElement("summary");
+    const count = meta.folded || 0;
+    const label = streaming
+      ? "Compacting…"
+      : active
+        ? "Context compacted"
+        : "Earlier compaction";
+    const note = streaming
+      ? "summarizing the conversation"
+      : `${count} message${count === 1 ? "" : "s"} folded${meta.auto ? " · automatic" : ""}`;
+    summary.innerHTML = `
+      <ha-icon icon="mdi:archive-arrow-down-outline"></ha-icon>
+      <span>${label}</span>
+      <span class="muted">${escapeHtml(note)}</span>`;
+    const body = document.createElement("div");
+    body.className = "compact-body";
+    body.textContent = streaming
+      ? this._compactText
+      : contentToText(message.content);
+    card.append(summary, body);
+    return card;
   }
 
   _msgActions(actions) {
@@ -1451,10 +1682,15 @@ class HaChatPanel extends HTMLElement {
     const chat = this._currentChat();
     const send = this.$("#send");
     const input = this.$("#input");
-    send.textContent = this._busy ? "■" : "➤";
-    send.title = this._busy ? "Stop generating" : "Send";
-    send.classList.toggle("stop", this._busy);
-    send.disabled = !this._busy && (this._executing || !!chat?.pending);
+    const running = this._busy || this._compacting;
+    send.textContent = running ? "■" : "➤";
+    send.title = this._compacting
+      ? "Stop compacting"
+      : this._busy
+        ? "Stop generating"
+        : "Send";
+    send.classList.toggle("stop", running);
+    send.disabled = !running && (this._executing || !!chat?.pending);
     const reason = this.$("#reason-btn");
     if (this._serverConfig?.supports_reasoning) {
       reason.removeAttribute("hidden");
@@ -1468,9 +1704,11 @@ class HaChatPanel extends HTMLElement {
     }
     input.placeholder = chat?.pending
       ? "Resolve the pending tool calls first…"
-      : this._busy
-        ? "Generating…"
-        : "Message…";
+      : this._compacting
+        ? "Compacting…"
+        : this._busy
+          ? "Generating…"
+          : "Message…";
     this._renderGauge(chat);
     this._renderCtxPopover();
   }
@@ -1489,8 +1727,10 @@ class HaChatPanel extends HTMLElement {
     }
     if (used == null) {
       estimated = true;
-      const text = chat ? JSON.stringify(chat.messages) : "";
-      used = Math.round((text.length + SYSTEM_PROMPT.length) / 4);
+      // Estimate what we would actually send, which after a fold is the
+      // summary rather than the whole chat.
+      const text = JSON.stringify(this._requestMessages(chat));
+      used = Math.round(text.length / 4);
     }
     // Fold in the in-flight request so the gauge and popover tick up live
     // while streaming.
@@ -1620,7 +1860,22 @@ class HaChatPanel extends HTMLElement {
       }">Context <span class="muted">·</span> ${approx}${fmtK(stats.used)} / ${fmtK(stats.limit)}</div>
       <div class="ctx-bar"><div class="ctx-bar-fill" style="width:${stats.pct}%;background:${barColor}"></div></div>
       <div class="ctx-row"><span>${stats.pct}% used</span><span>${approx}${fmtK(remaining)} remaining</span></div>
+      <button id="compact-btn" class="secondary ctx-compact"${this._canCompact(chat) ? "" : " disabled"}>
+        <ha-icon icon="mdi:archive-arrow-down-outline"></ha-icon>
+        <span>${this._compacting ? "Compacting…" : "Compact conversation"}</span>
+      </button>
+      <p class="muted small ctx-compact-hint">Replaces the history sent to the
+      model with a summary of it. Nothing is deleted from the chat.${
+        this._autoCompact
+          ? ` Happens on its own past ${Math.round(COMPACT_AT * 100)}%.`
+          : ""
+      }</p>
       ${details}`;
+    const compact = popover.querySelector("#compact-btn");
+    compact.addEventListener("click", () => {
+      popover.setAttribute("hidden", "");
+      this._compact(this._currentChat());
+    });
     const box = popover.querySelector(".ctx-details");
     if (box) {
       box.addEventListener("toggle", () => {
@@ -1663,6 +1918,30 @@ class HaChatPanel extends HTMLElement {
     });
     info.appendChild(refresh);
     body.appendChild(info);
+
+    const compaction = document.createElement("div");
+    compaction.className = "settings-section";
+    const ch = document.createElement("h3");
+    ch.textContent = "Compaction";
+    const toggle = document.createElement("label");
+    toggle.className = "toggle-row";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = this._autoCompact;
+    box.addEventListener("change", () => {
+      this._autoCompact = box.checked;
+      saveJson(STORAGE_AUTO_COMPACT, this._autoCompact);
+      this._renderCtxPopover();
+    });
+    const label = document.createElement("span");
+    label.textContent = `Compact automatically at ${Math.round(COMPACT_AT * 100)}% of the context window`;
+    toggle.append(box, label);
+    const note = document.createElement("p");
+    note.className = "muted small";
+    note.textContent =
+      "The conversation so far is summarized and later turns continue from that summary instead of the full history. The history stays in the chat, dimmed. You can also compact at any time from the context gauge.";
+    compaction.append(ch, toggle, note);
+    body.appendChild(compaction);
 
     const auto = document.createElement("div");
     auto.className = "settings-section";
@@ -1818,6 +2097,17 @@ const STYLES = `
     border-radius: 3px;
     background: var(--primary-color, #03a9f4);
   }
+  .ctx-compact {
+    width: 100%;
+    margin-top: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+  }
+  .ctx-compact ha-icon { --mdc-icon-size: 16px; }
+  .ctx-compact[disabled] { opacity: 0.45; cursor: default; }
+  .ctx-compact-hint { margin: 6px 0 0; line-height: 1.4; }
   .ctx-details {
     margin-top: 10px;
     border-top: 1px solid var(--divider-color, #e0e0e0);
@@ -2107,6 +2397,38 @@ const STYLES = `
     overflow-y: auto;
   }
 
+  .compact-card {
+    border: 1px dashed var(--divider-color, #e0e0e0);
+    background: var(--secondary-background-color, #f5f5f5);
+    border-radius: 12px;
+    font-size: 13px;
+    overflow: hidden;
+  }
+  .compact-card > summary {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 12px;
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+  }
+  .compact-card > summary::-webkit-details-marker { display: none; }
+  .compact-card ha-icon {
+    --mdc-icon-size: 18px;
+    flex: none;
+    color: var(--primary-color, #03a9f4);
+  }
+  .compact-card .muted { margin-left: auto; font-size: 12px; text-align: right; }
+  .compact-body {
+    padding: 0 12px 11px;
+    white-space: pre-wrap;
+    line-height: 1.45;
+  }
+  .compact-card.superseded { opacity: 0.5; }
+  /* Folded turns stay readable but are no longer sent to the model. */
+  .msg-row.folded, .tool-card.folded { opacity: 0.45; }
+
   .tool-card {
     border: 1px solid var(--divider-color, #e0e0e0);
     background: var(--card-background-color, #fff);
@@ -2290,6 +2612,15 @@ const STYLES = `
     padding: 4px 0;
     border-bottom: 1px dashed var(--divider-color, #e0e0e0);
   }
+  .toggle-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  .toggle-row input { flex: none; accent-color: var(--primary-color, #03a9f4); }
 `;
 
 customElements.define("ha-chat-panel", HaChatPanel);

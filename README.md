@@ -48,11 +48,24 @@ Settings are stored server-side in the integration, so they apply on every devic
   - **Always allow** — run it and auto-approve this tool from now on
   - **Reject** — skip it; the model is told the call was rejected
 - Responses stream in with a live tokens/s readout; the ■ button stops generation mid-response.
-- The ring gauge next to the send button shows context utilization — click it for a token breakdown.
-- The ⚙ settings dialog shows the active model, the configured endpoints, the tool count, and lets you revoke "always allow" tools.
+- The ring gauge next to the send button shows context utilization — click it for a token breakdown
+  and a **Compact conversation** button.
+- The ⚙ settings dialog shows the active model, the configured endpoints, the tool count, lets you revoke
+  "always allow" tools, and toggles automatic compaction.
+
+### Compaction
+
+Long conversations eventually fill the model's context window. **Compacting** asks the model to summarize
+the conversation so far; later turns then continue from that summary instead of the full history.
+
+- Click the context gauge → **Compact conversation** to do it on demand.
+- It also happens on its own once context passes **85%**, after a turn finishes. Turn that off in ⚙ → *Compaction*.
+- Nothing is deleted: the full history stays in the chat, dimmed, above a collapsible card holding the summary.
+- Stopping mid-summary, an error, or an empty summary rolls back and leaves the chat untouched.
 
 ## Notes & limitations
 
 - The panel and its API are admin-only, since the tools can modify your Home Assistant configuration.
 - A safety cap stops after 15 consecutive tool rounds without user input.
+- Automatic compaction only triggers between turns, never partway through a run of tool calls.
 - Tokens/s and the context gauge use real usage numbers when your LLM server reports them, and `~`-prefixed estimates otherwise.

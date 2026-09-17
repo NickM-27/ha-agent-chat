@@ -237,6 +237,9 @@ async def ws_chat(
         vol.Optional("model"): str,
         # True/False force reasoning on/off; omitted leaves the server default.
         vol.Optional("reasoning"): vol.Any(bool, None),
+        # Compaction asks for a plain summary; the tool schema is the bulk of
+        # the prompt and a summary has no use for it.
+        vol.Optional("with_tools", default=True): bool,
     }
 )
 @websocket_api.async_response
@@ -265,11 +268,12 @@ async def ws_chat_stream(
 
     warning = None
     tools: list[dict[str, Any]] = []
-    try:
-        tools = _openai_tools(await runtime.mcp.async_list_tools())
-    except MCPError as err:
-        warning = f"MCP server unavailable, chatting without tools: {err}"
-        _LOGGER.warning(warning)
+    if msg["with_tools"]:
+        try:
+            tools = _openai_tools(await runtime.mcp.async_list_tools())
+        except MCPError as err:
+            warning = f"MCP server unavailable, chatting without tools: {err}"
+            _LOGGER.warning(warning)
 
     def _send_event(payload: dict[str, Any]) -> None:
         try:
