@@ -24,6 +24,19 @@ const SYSTEM_PROMPT = [
   "Be concise. Use markdown code blocks for YAML or JSON.",
 ].join(" ");
 
+// The compaction request gets its own system prompt. Reusing the chat one
+// would carry "just make the call" into a task that wants prose, and some
+// models answer it with a tool call and no content at all.
+const COMPACT_SYSTEM = [
+  "You summarize transcripts of a Home Assistant assistant session.",
+  "Reply with the summary and nothing else: no tool calls, no questions, no commentary, no offer to help.",
+].join(" ");
+
+// Prefixes an earlier summary when compacting a second time, so the new one
+// absorbs it instead of dropping everything the first one covered.
+const COMPACT_PRIOR =
+  "Summary of the earlier part of this conversation. Carry everything still relevant from it into the new summary:";
+
 // Asked as a final user turn when compacting. The reply becomes the summary.
 const COMPACT_PROMPT = [
   "Summarize this conversation so it can stand in for the full history.",
@@ -278,7 +291,12 @@ class HaChatPanel extends HTMLElement {
     this._stopCurrent = null;
     this._compacting = false;
     this._compactText = "";
+    this._compactThink = "";
     this._compactRaf = null;
+    // Which compaction cards the reader has expanded, keyed by marker
+    // timestamp. Kept out of the chat so toggling isn't a saved edit, and so
+    // rebuilding the message list doesn't snap them shut.
+    this._openCompactions = new Set();
     this._autoCompact = loadJson(STORAGE_AUTO_COMPACT, true);
     // null = follow the server's default until the user flips the toggle.
     this._reasoningPref = loadJson(STORAGE_REASONING, null);
@@ -513,6 +531,7 @@ class HaChatPanel extends HTMLElement {
     if (!this._canCompact(chat)) return;
     this._compacting = true;
     this._compactText = "";
+    this._compactThink = "";
     this._error = null;
     this._render();
 
@@ -525,6 +544,7 @@ class HaChatPanel extends HTMLElement {
       finished = true;
       this._compacting = false;
       this._compactText = "";
+      this._compactThink = "";
       try {
         unsub?.();
       } catch (e) {
@@ -538,11 +558,14 @@ class HaChatPanel extends HTMLElement {
         this._render();
         return;
       }
+      const at = Date.now();
       chat.messages.push({
         role: "system",
         content: summary.trim(),
-        _ui: { compaction: true, folded, at: Date.now(), auto },
+        _ui: { compaction: true, folded, at, auto },
       });
+      // Show the summary straight away; the reader can collapse it after.
+      this._openCompactions.add(at);
       // Counts from before the fold describe a prompt we no longer send, so
       // the gauge falls back to estimating the compacted context right away.
       chat.usage = null;
@@ -556,8 +579,26 @@ class HaChatPanel extends HTMLElement {
       if (ev.type === "delta") {
         this._compactText += ev.content;
         this._renderCompactStream();
+      } else if (ev.type === "think") {
+        // Shown greyed until real content arrives, so a reasoning model
+        // doesn't leave the box blank.
+        this._compactThink += ev.content;
+        this._renderCompactStream();
       } else if (ev.type === "done") {
-        finish(contentToText(ev.message?.content));
+        const summary = this._summaryFrom(ev);
+        if (!summary && ev.message?.tool_calls?.length) {
+          // The model reached for a tool instead of answering, which means
+          // the tool schema was still attached to the summary request.
+          finish(
+            null,
+            "The model tried to call a tool instead of summarizing. Restart Home Assistant so HA Chat can ask for the summary without tools."
+          );
+        } else {
+          finish(
+            summary,
+            "The model returned an empty summary — nothing was compacted."
+          );
+        }
       } else if (ev.type === "error") {
         finish(null, ev.error || "Compaction failed");
       }
@@ -565,17 +606,31 @@ class HaChatPanel extends HTMLElement {
 
     this._stopCurrent = () => finish(null);
 
+    // Summarize under a summarizer's system prompt, over the turns since the
+    // last fold, with any earlier summary carried in so re-compacting doesn't
+    // lose what it covered.
+    const index = this._compactIndex(chat);
+    const prior = index >= 0 ? contentToText(chat.messages[index].content) : "";
     const request = {
       type: "ha_chat/chat_stream",
       messages: [
-        ...this._requestMessages(chat),
+        {
+          role: "system",
+          content: prior
+            ? `${COMPACT_SYSTEM}\n\n${COMPACT_PRIOR}\n\n${prior}`
+            : COMPACT_SYSTEM,
+        },
+        ...chat.messages.slice(index + 1),
         { role: "user", content: COMPACT_PROMPT },
       ],
       with_tools: false,
     };
     if (this._model) request.model = this._model;
-    // A summary is not worth a reasoning pass.
-    if (this._serverConfig?.supports_reasoning) request.reasoning = false;
+    // Always ask for thinking off, not just when the model is known to
+    // support it: reasoning detection is best-effort, and a model that thinks
+    // here can put the whole summary in the reasoning channel and leave the
+    // content empty. Servers that don't understand the field drop it.
+    request.reasoning = false;
 
     try {
       unsub = await this._hass.connection.subscribeMessage(onEvent, request, {
@@ -594,6 +649,16 @@ class HaChatPanel extends HTMLElement {
     }
   }
 
+  // The summary text out of a finished compaction stream. Some models answer
+  // entirely inside the reasoning channel, and some leave an inline <think>
+  // block in the content; both would otherwise read as an empty summary and
+  // silently roll the compaction back.
+  _summaryFrom(ev) {
+    const content = contentToText(ev.message?.content);
+    const text = content.trim() ? content : contentToText(ev.reasoning);
+    return text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+  }
+
   _renderCompactStream() {
     if (this._compactRaf) return;
     this._compactRaf = requestAnimationFrame(() => {
@@ -609,7 +674,9 @@ class HaChatPanel extends HTMLElement {
       const atBottom =
         container.scrollHeight - container.scrollTop - container.clientHeight <
         80;
-      body.textContent = this._compactText;
+      const thinking = !this._compactText && this._compactThink;
+      body.className = `compact-body${thinking ? " compact-thinking" : ""}`;
+      body.textContent = this._compactText || this._compactThink;
       this._renderGauge(this._currentChat());
       if (atBottom) container.scrollTop = container.scrollHeight;
     });
@@ -1538,6 +1605,12 @@ class HaChatPanel extends HTMLElement {
     if (streaming) {
       card.id = "compact-stream";
       card.open = true;
+    } else {
+      card.open = this._openCompactions.has(meta.at);
+      card.addEventListener("toggle", () => {
+        if (card.open) this._openCompactions.add(meta.at);
+        else this._openCompactions.delete(meta.at);
+      });
     }
     const summary = document.createElement("summary");
     const count = meta.folded || 0;
@@ -1547,16 +1620,22 @@ class HaChatPanel extends HTMLElement {
         ? "Context compacted"
         : "Earlier compaction";
     const note = streaming
-      ? "summarizing the conversation"
+      ? this._compactText
+        ? "writing the summary"
+        : "summarizing the conversation"
       : `${count} message${count === 1 ? "" : "s"} folded${meta.auto ? " · automatic" : ""}`;
     summary.innerHTML = `
       <ha-icon icon="mdi:archive-arrow-down-outline"></ha-icon>
       <span>${label}</span>
-      <span class="muted">${escapeHtml(note)}</span>`;
+      <span class="muted">${escapeHtml(note)}</span>
+      <span class="compact-caret">›</span>`;
     const body = document.createElement("div");
-    body.className = "compact-body";
+    // While streaming, fall back to the reasoning text so the box shows
+    // progress even before the summary proper starts.
+    const thinking = streaming && !this._compactText && this._compactThink;
+    body.className = `compact-body${thinking ? " compact-thinking" : ""}`;
     body.textContent = streaming
-      ? this._compactText
+      ? this._compactText || this._compactThink
       : contentToText(message.content);
     card.append(summary, body);
     return card;
@@ -2463,10 +2542,21 @@ const STYLES = `
     color: var(--primary-color, #03a9f4);
   }
   .compact-card .muted { margin-left: auto; font-size: 12px; text-align: right; }
+  .compact-caret {
+    flex: none;
+    color: var(--secondary-text-color, #727272);
+    transform: rotate(90deg);
+    transition: transform 0.15s ease;
+  }
+  .compact-card[open] .compact-caret { transform: rotate(-90deg); }
   .compact-body {
     padding: 0 12px 11px;
     white-space: pre-wrap;
     line-height: 1.45;
+  }
+  .compact-thinking {
+    color: var(--secondary-text-color, #727272);
+    font-style: italic;
   }
   .compact-card.superseded { opacity: 0.5; }
   /* Folded turns stay readable but are no longer sent to the model. */
