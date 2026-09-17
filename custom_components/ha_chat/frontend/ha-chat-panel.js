@@ -293,10 +293,11 @@ class HaChatPanel extends HTMLElement {
     this._compactText = "";
     this._compactThink = "";
     this._compactRaf = null;
-    // Which compaction cards the reader has expanded, keyed by marker
+    // Explicit expand/collapse per compaction card, keyed by marker
     // timestamp. Kept out of the chat so toggling isn't a saved edit, and so
-    // rebuilding the message list doesn't snap them shut.
-    this._openCompactions = new Set();
+    // rebuilding the message list doesn't snap cards shut. Anything not in
+    // here follows the default: the newest fold open, older ones closed.
+    this._compactOpen = new Map();
     this._autoCompact = loadJson(STORAGE_AUTO_COMPACT, true);
     // null = follow the server's default until the user flips the toggle.
     this._reasoningPref = loadJson(STORAGE_REASONING, null);
@@ -558,14 +559,11 @@ class HaChatPanel extends HTMLElement {
         this._render();
         return;
       }
-      const at = Date.now();
       chat.messages.push({
         role: "system",
         content: summary.trim(),
-        _ui: { compaction: true, folded, at, auto },
+        _ui: { compaction: true, folded, at: Date.now(), auto },
       });
-      // Show the summary straight away; the reader can collapse it after.
-      this._openCompactions.add(at);
       // Counts from before the fold describe a prompt we no longer send, so
       // the gauge falls back to estimating the compacted context right away.
       chat.usage = null;
@@ -842,7 +840,8 @@ class HaChatPanel extends HTMLElement {
   _recordUsage(chat, meta) {
     chat.usage = meta.usage || chat.usage;
     chat.timings = meta.timings || null;
-    if (meta.rate) chat.rate = meta.rate;
+    // Speed is read back off the individual messages by _avgSpeed, so there
+    // is no chat-level rate to keep here.
     // "evaluated" counts only freshly processed prompt tokens when the server
     // reports cache hits.
     const totals = (chat.totals = chat.totals || { evaluated: 0, generated: 0 });
@@ -856,32 +855,41 @@ class HaChatPanel extends HTMLElement {
     const produced =
       meta.usage?.completion_tokens ?? meta.timings?.predicted_n ?? 0;
     totals.generated += produced;
-    // Time spent generating, for the conversation-wide average speed.
-    // llama.cpp reports it outright; otherwise back it out of the turn's own
-    // rate. `timedTokens` counts only the turns that contributed a duration,
-    // so the two always describe the same set of turns and a turn the server
-    // said nothing about cannot inflate the average.
-    let turnMs = null;
-    const predictedMs = meta.timings?.predicted_ms;
-    if (typeof predictedMs === "number" && predictedMs > 0) {
-      turnMs = predictedMs;
-    } else if (produced && meta.rate > 0) {
-      turnMs = (produced / meta.rate) * 1000;
-    }
-    if (turnMs) {
-      totals.generationMs = (totals.generationMs || 0) + turnMs;
-      totals.timedTokens = (totals.timedTokens || 0) + produced;
-    }
   }
 
-  // Average generation speed across the whole conversation: every token
-  // generated over all the time spent generating, so each turn weighs by its
-  // own size. The in-flight turn is folded in, which keeps the figure moving
-  // while a response streams.
+  // How long one recorded turn spent generating, and how many tokens it
+  // produced. Returns null when the turn carries nothing to go on.
+  _turnSpeed(ui) {
+    if (!ui) return null;
+    const tokens =
+      ui.usage?.completion_tokens ?? ui.timings?.predicted_n ?? ui.tokens;
+    if (!tokens) return null;
+    const predictedMs = ui.timings?.predicted_ms;
+    if (predictedMs > 0) return { tokens, ms: predictedMs };
+    // No server timing for this turn, so back the duration out of the rate
+    // shown under the message itself.
+    if (ui.rate > 0) return { tokens, ms: (tokens / ui.rate) * 1000 };
+    return null;
+  }
+
+  // Average generation speed across the whole session: every token generated
+  // over all the time spent generating, so each turn weighs by its own size.
+  //
+  // Read back off the per-message metadata the transcript already shows,
+  // rather than a running counter. A counter only grew on turns where the
+  // server happened to report a usable duration, so a session of turns it
+  // said nothing about left the figure empty; this uses the same numbers as
+  // the tok/s line under each message, survives a reload, and still works for
+  // turns recorded before any of this existed.
   _avgSpeed(chat, streaming, live) {
-    const totals = chat?.totals;
-    let tokens = totals?.timedTokens || 0;
-    let ms = totals?.generationMs || 0;
+    let tokens = 0;
+    let ms = 0;
+    for (const message of chat?.messages || []) {
+      const turn = this._turnSpeed(message._ui);
+      if (!turn) continue;
+      tokens += turn.tokens;
+      ms += turn.ms;
+    }
     if (streaming) {
       if (live?.predicted_ms > 0 && live?.predicted_n) {
         tokens += live.predicted_n;
@@ -1460,12 +1468,11 @@ class HaChatPanel extends HTMLElement {
     }
 
     const messages = chat?.messages || [];
-    // Everything before the newest marker is still shown, but it no longer
-    // reaches the model; dim it so the boundary is visible.
+    // The card itself marks where the history stopped being sent, so earlier
+    // turns render exactly like the rest of the transcript.
     const compactAt = this._compactIndex(chat);
     for (let i = 0; i < messages.length; i++) {
       const message = messages[i];
-      const folded = compactAt >= 0 && i < compactAt ? " folded" : "";
       if (message._ui?.compaction) {
         container.appendChild(this._compactCard(message, i === compactAt));
         continue;
@@ -1478,7 +1485,7 @@ class HaChatPanel extends HTMLElement {
           continue;
         }
         const row = document.createElement("div");
-        row.className = `msg-row user${folded}`;
+        row.className = "msg-row user";
         const bubble = document.createElement("div");
         bubble.className = "bubble user";
         bubble.innerHTML = renderMarkdown(message.content);
@@ -1507,7 +1514,7 @@ class HaChatPanel extends HTMLElement {
       const clean = text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
       if (clean) {
         const row = document.createElement("div");
-        row.className = `msg-row assistant${folded}`;
+        row.className = "msg-row assistant";
         const bubble = document.createElement("div");
         bubble.className = "bubble assistant";
         bubble.innerHTML = renderMarkdown(text);
@@ -1526,9 +1533,7 @@ class HaChatPanel extends HTMLElement {
       for (const tc of message.tool_calls || []) {
         const isPending = chat.pending?.calls.some((c) => c.id === tc.id);
         if (isPending) continue; // rendered as an approval card below
-        const card = this._toolHistoryCard(tc, toolResults.get(tc.id));
-        card.className += folded;
-        container.appendChild(card);
+        container.appendChild(this._toolHistoryCard(tc, toolResults.get(tc.id)));
       }
       if (
         message._ui &&
@@ -1596,7 +1601,7 @@ class HaChatPanel extends HTMLElement {
 
   // The fold marker in the transcript. `message` is null while the summary
   // is still streaming in. Superseded markers (an older fold, now inside a
-  // newer one) render dimmed.
+  // newer one) render faded and collapsed.
   _compactCard(message, active) {
     const streaming = !message;
     const meta = message?._ui || {};
@@ -1606,11 +1611,11 @@ class HaChatPanel extends HTMLElement {
       card.id = "compact-stream";
       card.open = true;
     } else {
-      card.open = this._openCompactions.has(meta.at);
-      card.addEventListener("toggle", () => {
-        if (card.open) this._openCompactions.add(meta.at);
-        else this._openCompactions.delete(meta.at);
-      });
+      const explicit = this._compactOpen.get(meta.at);
+      card.open = explicit === undefined ? active : explicit;
+      card.addEventListener("toggle", () =>
+        this._compactOpen.set(meta.at, card.open)
+      );
     }
     const summary = document.createElement("summary");
     const count = meta.folded || 0;
@@ -1939,13 +1944,10 @@ class HaChatPanel extends HTMLElement {
       : usage?.completion_tokens ?? timings?.predicted_n ?? null;
     const total =
       prompt != null && generated != null ? prompt + generated : null;
-    let speed =
-      timings?.predicted_per_second ?? (streaming ? null : chat?.rate);
-    if (streaming && !speed && this._streamStart && this._streamChunks >= 5) {
-      const seconds = (performance.now() - this._streamStart) / 1000;
-      if (seconds > 0.5) speed = this._streamChunks / seconds;
-    }
     const totals = chat?.totals;
+    // Only a session-wide figure here. The current turn's rate is already on
+    // the meta line under the message itself, and a per-turn row in this
+    // panel just reads as blank whenever nothing is generating.
     const avgSpeed = this._avgSpeed(chat, streaming, live);
     const tps = (value) => (value ? `${Number(value).toFixed(1)} t/s` : "—");
 
@@ -1967,7 +1969,6 @@ class HaChatPanel extends HTMLElement {
           }
           <div class="kv"><span>Generated</span><span>${streaming && !live ? "~" : ""}${tok(generated)}</span></div>
           <div class="kv ctx-total"><span>${cached != null ? "KV cache total" : "Total"}</span><span>${tok(total)}</span></div>
-          <div class="kv ctx-speed"><span>Speed</span><span>${tps(speed)}</span></div>
         </details>`;
     } else {
       details =
@@ -2061,7 +2062,7 @@ class HaChatPanel extends HTMLElement {
     const note = document.createElement("p");
     note.className = "muted small";
     note.textContent =
-      "The conversation so far is summarized and later turns continue from that summary instead of the full history. The history stays in the chat, dimmed. You can also compact at any time from the context gauge.";
+      "The conversation so far is summarized and later turns continue from that summary instead of the full history. Nothing is removed from the chat, and the summary stays visible in a card where the fold happened. You can also compact at any time from the context gauge.";
     compaction.append(ch, toggle, note);
     body.appendChild(compaction);
 
@@ -2520,6 +2521,10 @@ const STYLES = `
   }
 
   .compact-card {
+    /* #messages is a column flex container, and the overflow below would
+       otherwise let this shrink to nothing: overflow turns min-height:auto
+       into min-height:0, so without flex:none the card collapses unread. */
+    flex: none;
     border: 1px dashed var(--divider-color, #e0e0e0);
     background: var(--secondary-background-color, #f5f5f5);
     border-radius: 12px;
@@ -2559,8 +2564,6 @@ const STYLES = `
     font-style: italic;
   }
   .compact-card.superseded { opacity: 0.5; }
-  /* Folded turns stay readable but are no longer sent to the model. */
-  .msg-row.folded, .tool-card.folded { opacity: 0.45; }
 
   .tool-card {
     border: 1px solid var(--divider-color, #e0e0e0);

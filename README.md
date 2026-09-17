@@ -60,7 +60,8 @@ the conversation so far; later turns then continue from that summary instead of 
 
 - Click the context gauge → **Compact conversation** to do it on demand.
 - It also happens on its own once context passes **85%**, after a turn finishes. Turn that off in ⚙ → *Compaction*.
-- Nothing is deleted: the full history stays in the chat, dimmed, above a collapsible card holding the summary.
+- Nothing is deleted: the full history stays in the chat, above a collapsible card holding the summary
+  the model wrote. The card marks where the history stopped being sent.
 - Stopping mid-summary, an error, or an empty summary rolls back and leaves the chat untouched.
 
 ## Notes & limitations
