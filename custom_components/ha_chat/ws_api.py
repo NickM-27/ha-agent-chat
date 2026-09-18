@@ -26,7 +26,7 @@ from .const import (
     WS_TYPE_CONFIG,
     WS_TYPE_TOOLS,
 )
-from .llm import (
+from .llm_client import (
     LLMError,
     async_chat_completion,
     async_fetch_models,
