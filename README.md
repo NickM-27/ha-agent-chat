@@ -36,7 +36,7 @@ Then go to **Settings → Devices & services → Add integration → HA Chat**.
 
 > **Tip:** the ha-mcp integration prints its connect URL in the Home Assistant log and shows it on the integration's Configure page.
 
-The **model** is picked in the panel itself: click the model chip in the chat header to choose from the models your LLM server reports on `/models`. The choice persists per browser.
+The **model** is picked in the panel itself: click the model chip in the chat header to choose from the models your LLM server reports on `/models`. The choice persists per browser. The same menu sets the **reasoning effort** for the selected model (*Default* / *Low* / *Medium* / *High* / *XHigh*); anything but *Default* is sent as `reasoning_effort`, and *Default* leaves it to the LLM server. It's remembered per model in this browser.
 
 Settings are stored server-side in the integration, so they apply on every device. Chats and tool auto-approvals persist per browser.
 
@@ -46,7 +46,7 @@ Settings are stored server-side in the integration, so they apply on every devic
 - When the model wants to call a tool, a card appears showing the tool name and its exact arguments:
   - **Approve** — run it once
   - **Always allow** — run it and auto-approve this tool from now on
-  - **Reject** — skip it; the model is told the call was rejected
+  - **Reject** — skip it; a dialog lets you optionally say why, and the model is told the call was rejected (with your reason, if given)
 - Responses stream in with a live tokens/s readout; the ■ button stops generation mid-response.
 - The ring gauge next to the send button shows context utilization — click it for a token breakdown
   and a **Compact conversation** button.

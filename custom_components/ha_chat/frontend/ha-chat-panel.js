@@ -10,7 +10,17 @@ const STORAGE_AUTO_APPROVE = "ha-chat:auto-approve:v1";
 const STORAGE_REASONING = "ha-chat:reasoning:v1";
 const STORAGE_MODEL = "ha-chat:model:v1";
 const STORAGE_AUTO_COMPACT = "ha-chat:auto-compact:v1";
+const STORAGE_REASONING_EFFORT = "ha-chat:reasoning-effort:v1";
 const MAX_AUTO_TURNS = 15;
+
+// Values for the request's reasoning_effort; "default" sends nothing.
+const REASONING_EFFORTS = [
+  ["default", "Default"],
+  ["low", "Low"],
+  ["medium", "Medium"],
+  ["high", "High"],
+  ["xhigh", "XHigh"],
+];
 
 // Context utilization that triggers automatic compaction, checked once a
 // turn has fully settled.
@@ -289,6 +299,8 @@ class HaChatPanel extends HTMLElement {
     this._ctxDetailsOpen = true;
     this._unsubStream = null;
     this._stopCurrent = null;
+    // {chat, callId} while the reject dialog is open.
+    this._rejectTarget = null;
     this._compacting = false;
     this._compactText = "";
     this._compactThink = "";
@@ -301,6 +313,8 @@ class HaChatPanel extends HTMLElement {
     this._autoCompact = loadJson(STORAGE_AUTO_COMPACT, true);
     // null = follow the server's default until the user flips the toggle.
     this._reasoningPref = loadJson(STORAGE_REASONING, null);
+    // Per-model reasoning_effort; a model missing here sends nothing.
+    this._reasoningEffort = loadJson(STORAGE_REASONING_EFFORT, {});
     // null = let the server pick (legacy configured model or first available).
     this._model = loadJson(STORAGE_MODEL, null);
 
@@ -369,6 +383,19 @@ class HaChatPanel extends HTMLElement {
   _reasoningOn() {
     if (this._reasoningPref !== null) return this._reasoningPref;
     return this._serverConfig?.reasoning_default ?? true;
+  }
+
+  _effort() {
+    return (this._model && this._reasoningEffort[this._model]) || "default";
+  }
+
+  _setEffort(effort) {
+    if (!this._model) return;
+    if (effort === "default") delete this._reasoningEffort[this._model];
+    else this._reasoningEffort[this._model] = effort;
+    saveJson(STORAGE_REASONING_EFFORT, this._reasoningEffort);
+    this._renderHeader();
+    this._renderModelMenu();
   }
 
   async _loadServerInfo() {
@@ -820,6 +847,8 @@ class HaChatPanel extends HTMLElement {
     if (this._serverConfig?.supports_reasoning) {
       request.reasoning = this._reasoningOn();
     }
+    const effort = this._effort();
+    if (effort !== "default") request.reasoning_effort = effort;
     try {
       unsub = await this._hass.connection.subscribeMessage(onEvent, request, {
         resubscribe: false,
@@ -974,6 +1003,30 @@ class HaChatPanel extends HTMLElement {
     this._maybeExecute(chat);
   }
 
+  _openRejectDialog(chat, call) {
+    this._rejectTarget = { chat, callId: call.id };
+    this.$("#reject-tool").textContent = call.name;
+    const reason = this.$("#reject-reason");
+    reason.value = "";
+    this.$("#reject-overlay").removeAttribute("hidden");
+    setTimeout(() => reason.focus(), 0);
+  }
+
+  _closeRejectDialog() {
+    this._rejectTarget = null;
+    this.$("#reject-overlay").setAttribute("hidden", "");
+  }
+
+  _confirmReject() {
+    const target = this._rejectTarget;
+    const reason = this.$("#reject-reason").value.trim();
+    this._closeRejectDialog();
+    if (!target) return;
+    const call = target.chat.pending?.calls.find((c) => c.id === target.callId);
+    if (call && reason) call.rejectReason = reason;
+    this._setCallStatus(target.chat, target.callId, "rejected");
+  }
+
   _alwaysAllow(chat, callId) {
     const call = chat.pending?.calls.find((c) => c.id === callId);
     if (!call) return;
@@ -1022,8 +1075,9 @@ class HaChatPanel extends HTMLElement {
     for (const call of calls) {
       let content;
       if (call.status === "rejected") {
-        content =
-          "The user rejected this tool call. Do not retry it unless asked.";
+        content = call.rejectReason
+          ? `The user rejected this tool call with the reason: ${call.rejectReason}\nTake that into account; do not retry the same call unless asked.`
+          : "The user rejected this tool call. Do not retry it unless asked.";
       } else {
         content = call.result ?? "(no output)";
       }
@@ -1194,6 +1248,22 @@ class HaChatPanel extends HTMLElement {
           <div id="settings-body"></div>
         </div>
       </div>
+      <div id="reject-overlay" hidden>
+        <div id="reject-dialog">
+          <div class="dialog-head">
+            <span>Reject <code id="reject-tool"></code></span>
+            <button id="reject-close" class="icon-btn">✕</button>
+          </div>
+          <div id="reject-body">
+            <label for="reject-reason" class="muted small">Reason (optional) — sent to the model so it can adjust</label>
+            <textarea id="reject-reason" rows="3" placeholder="e.g. Use the kitchen light instead"></textarea>
+            <div class="tool-actions">
+              <button id="reject-cancel" class="secondary">Cancel</button>
+              <button id="reject-confirm" class="danger">Reject</button>
+            </div>
+          </div>
+        </div>
+      </div>
     `;
     this.$ = (sel) => this.shadowRoot.querySelector(sel);
 
@@ -1213,6 +1283,20 @@ class HaChatPanel extends HTMLElement {
     this.$("#settings-overlay").addEventListener("click", (ev) => {
       if (ev.target === ev.currentTarget) {
         this.$("#settings-overlay").setAttribute("hidden", "");
+      }
+    });
+    this.$("#reject-close").addEventListener("click", () => this._closeRejectDialog());
+    this.$("#reject-cancel").addEventListener("click", () => this._closeRejectDialog());
+    this.$("#reject-overlay").addEventListener("click", (ev) => {
+      if (ev.target === ev.currentTarget) this._closeRejectDialog();
+    });
+    this.$("#reject-confirm").addEventListener("click", () => this._confirmReject());
+    this.$("#reject-reason").addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" && !ev.shiftKey) {
+        ev.preventDefault();
+        this._confirmReject();
+      } else if (ev.key === "Escape") {
+        this._closeRejectDialog();
       }
     });
     this.$("#ctx-gauge").addEventListener("click", () => this._toggleCtxPopover());
@@ -1300,10 +1384,19 @@ class HaChatPanel extends HTMLElement {
     label.className = "chip-label";
     label.textContent =
       this._model || (this._serverConfig ? "no model" : "…");
+    chip.appendChild(label);
+    const effort = this._effort();
+    if (effort !== "default") {
+      const tag = document.createElement("span");
+      tag.className = "chip-effort";
+      tag.textContent = effort;
+      tag.title = `Reasoning effort: ${effort}`;
+      chip.appendChild(tag);
+    }
     const caret = document.createElement("span");
     caret.className = "chip-caret";
     caret.textContent = "▾";
-    chip.append(label, caret);
+    chip.appendChild(caret);
     chip.addEventListener("click", () => this._toggleModelMenu());
     status.appendChild(chip);
     const toolsChip = document.createElement("span");
@@ -1356,6 +1449,29 @@ class HaChatPanel extends HTMLElement {
       item.addEventListener("click", () => this._selectModel(model));
       menu.appendChild(item);
     }
+    if (!this._model) return;
+
+    const section = document.createElement("div");
+    section.className = "effort-section";
+    const heading = document.createElement("div");
+    heading.className = "effort-label muted small";
+    heading.textContent = "Reasoning effort";
+    const group = document.createElement("div");
+    group.className = "effort-group";
+    const current = this._effort();
+    for (const [value, text] of REASONING_EFFORTS) {
+      const btn = document.createElement("button");
+      btn.className = "effort-btn" + (value === current ? " active" : "");
+      btn.textContent = text;
+      btn.title =
+        value === "default"
+          ? "Don't send reasoning_effort; the LLM server decides"
+          : `Send reasoning_effort: ${value}`;
+      btn.addEventListener("click", () => this._setEffort(value));
+      group.appendChild(btn);
+    }
+    section.append(heading, group);
+    menu.appendChild(section);
   }
 
   _renderChatList() {
@@ -1788,11 +1904,14 @@ class HaChatPanel extends HTMLElement {
       const reject = document.createElement("button");
       reject.className = "danger";
       reject.textContent = "Reject";
-      reject.addEventListener("click", () =>
-        this._setCallStatus(chat, call.id, "rejected")
-      );
+      reject.addEventListener("click", () => this._openRejectDialog(chat, call));
       actions.append(approve, always, reject);
       card.appendChild(actions);
+    } else if (call.status === "rejected" && call.rejectReason) {
+      const note = document.createElement("div");
+      note.className = "muted small";
+      note.textContent = `Reason: ${call.rejectReason}`;
+      card.appendChild(note);
     } else if (call.status === "approved" && this.autoApprove.has(call.name)) {
       const note = document.createElement("div");
       note.className = "muted small";
@@ -2303,6 +2422,14 @@ const STYLES = `
   }
   .chip-label { overflow: hidden; text-overflow: ellipsis; }
   .chip-caret { flex: none; font-size: 9px; }
+  .chip-effort {
+    flex: none;
+    font-size: 10px;
+    padding: 0 5px;
+    border-radius: 6px;
+    background: var(--primary-color, #03a9f4);
+    color: var(--text-primary-color, #fff);
+  }
 
   #model-menu[hidden] { display: none; }
   #model-menu {
@@ -2310,7 +2437,7 @@ const STYLES = `
     top: calc(100% + 4px);
     right: 12px;
     z-index: 6;
-    min-width: 200px;
+    min-width: 280px;
     max-width: min(340px, calc(100vw - 24px));
     max-height: 50vh;
     overflow-y: auto;
@@ -2337,6 +2464,32 @@ const STYLES = `
   .model-item.active {
     color: var(--primary-color, #03a9f4);
     font-weight: 600;
+  }
+  .effort-section {
+    border-top: 1px solid var(--divider-color, #e0e0e0);
+    margin-top: 4px;
+    padding: 8px 6px 4px;
+  }
+  .effort-label { margin-bottom: 6px; }
+  .effort-group {
+    display: flex;
+    border: 1px solid var(--divider-color, #e0e0e0);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .effort-btn {
+    flex: 1;
+    background: transparent;
+    color: var(--primary-text-color, #212121);
+    border-radius: 0;
+    padding: 6px 4px;
+    font-size: 12px;
+  }
+  .effort-btn + .effort-btn { border-left: 1px solid var(--divider-color, #e0e0e0); }
+  .effort-btn:hover { background: var(--secondary-background-color, #f5f5f5); }
+  .effort-btn.active {
+    background: var(--primary-color, #03a9f4);
+    color: var(--text-primary-color, #fff);
   }
 
   #banner-area { flex: none; }
@@ -2707,9 +2860,9 @@ const STYLES = `
   #layout.narrow .bubble, #layout.narrow .tool-card { max-width: 92%; }
   #layout.narrow .edit-box { width: 92%; }
 
-  /* settings dialog */
-  #settings-overlay[hidden] { display: none; }
-  #settings-overlay {
+  /* settings / reject dialogs */
+  #settings-overlay[hidden], #reject-overlay[hidden] { display: none; }
+  #settings-overlay, #reject-overlay {
     position: fixed;
     inset: 0;
     background: rgba(0,0,0,0.4);
@@ -2718,7 +2871,7 @@ const STYLES = `
     justify-content: center;
     z-index: 10;
   }
-  #settings-dialog {
+  #settings-dialog, #reject-dialog {
     background: var(--card-background-color, #fff);
     border-radius: 12px;
     width: min(480px, 92vw);
@@ -2736,6 +2889,24 @@ const STYLES = `
     font-size: 16px;
   }
   #settings-body { padding: 8px 18px 18px; }
+  #reject-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 14px 18px 18px;
+  }
+  #reject-body .tool-actions { justify-content: flex-end; margin-top: 4px; }
+  #reject-reason {
+    resize: vertical;
+    border: 1px solid var(--divider-color, #e0e0e0);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font: inherit;
+    background: var(--primary-background-color, #fafafa);
+    color: inherit;
+    outline: none;
+  }
+  #reject-reason:focus { border-color: var(--primary-color, #03a9f4); }
   .settings-section { margin-top: 12px; }
   .settings-section h3 { margin: 8px 0; font-size: 14px; }
   .kv { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; padding: 3px 0; }

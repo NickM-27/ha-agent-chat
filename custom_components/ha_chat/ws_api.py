@@ -237,6 +237,8 @@ async def ws_chat(
         vol.Optional("model"): str,
         # True/False force reasoning on/off; omitted leaves the server default.
         vol.Optional("reasoning"): vol.Any(bool, None),
+        # Sent as reasoning_effort; omitted leaves the server default.
+        vol.Optional("reasoning_effort"): vol.In(["low", "medium", "high", "xhigh"]),
         # Compaction asks for a plain summary; the tool schema is the bulk of
         # the prompt and a summary has no use for it.
         vol.Optional("with_tools", default=True): bool,
@@ -300,6 +302,7 @@ async def ws_chat_stream(
                 tools=tools or None,
                 api_key=conf.get(CONF_LLM_API_KEY),
                 reasoning=msg.get("reasoning"),
+                reasoning_effort=msg.get("reasoning_effort"),
             )
             async for chunk in stream:
                 if chunk.get("usage"):

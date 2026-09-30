@@ -144,6 +144,7 @@ async def async_stream_chat_completion(
     tools: list[dict[str, Any]] | None = None,
     api_key: str | None = None,
     reasoning: bool | None = None,
+    reasoning_effort: str | None = None,
 ):
     """Yield parsed SSE chunks from a streaming chat completion."""
     url = base_url.rstrip("/") + "/chat/completions"
@@ -169,9 +170,13 @@ async def async_stream_chat_completion(
         # (llama.cpp, vLLM) honor enable_thinking=False.
         payload["reasoning_effort"] = "none"
         payload["chat_template_kwargs"] = {"enable_thinking": False}
-    elif reasoning is True:
-        # Explicit enable so the toggle can override a server-side default of off.
-        payload["chat_template_kwargs"] = {"enable_thinking": True}
+    else:
+        if reasoning is True:
+            # Explicit enable so the toggle can override a server-side default
+            # of off.
+            payload["chat_template_kwargs"] = {"enable_thinking": True}
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
 
     # Nonstandard fields some servers reject with a 400; drop the ones the
     # error message names and retry.
